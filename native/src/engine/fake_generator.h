@@ -28,6 +28,7 @@ class FakeGenerator final : public model::Generator {
 
   struct Call {
     std::vector<int32_t> prompt_ids;
+    std::vector<model::PromptImage> images;
     int max_new_tokens = 0;
     model::Sampling sampling;
     int yielded = 0;
@@ -42,7 +43,8 @@ class FakeGenerator final : public model::Generator {
   int max_model_len() const override { return max_model_len_; }
   model::GenerateStats generate(std::span<const int32_t> prompt, int max_new_tokens,
                                 const model::Sampling& sampling, std::span<const int32_t> stop_ids,
-                                const std::function<bool(std::span<const int32_t>)>& on_tokens) override;
+                                const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                                std::span<const model::PromptImage> images = {}) override;
 
   std::string echo(std::span<const int32_t> prompt_ids) const;
   std::vector<Call> calls() const;

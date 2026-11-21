@@ -82,6 +82,7 @@ foreach(area ${INGINE_KERNEL_AREAS})
 endforeach()
 
 ingine_add_component(src/offload)
+ingine_add_component(src/vision)
 ingine_add_component(src/model)
 ingine_add_component(src/engine)
 ingine_add_component(src/serve)

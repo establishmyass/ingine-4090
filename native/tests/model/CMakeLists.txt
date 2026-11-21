@@ -6,6 +6,8 @@ ingine_add_test(NAME model_layer SOURCES test_layer.cpp LIBS ingine_model GPU MO
 ingine_add_test(NAME model_runtime SOURCES test_runtime.cpp LIBS ingine_model GPU TIMEOUT 600)
 # prompt checkpoints with speculative decoding on the full model (~22 GB of GPU memory)
 ingine_add_test(NAME model_reuse SOURCES test_reuse.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
+# image spans in the prompt (PromptImage): exact against the text prompt, prefix reuse with images (~20 GB)
+ingine_add_test(NAME model_images SOURCES test_images.cpp LIBS ingine_model GPU MODEL TIMEOUT 900)
 # full-model parity against the Python engine's goldens (tools/goldens_model.py); ~20 GB of GPU memory
 if(TARGET ingine-validate)
   set(_validate ingine-validate --model-dir ${INGINE_TEST_MODEL_DIR} --golden ${PROJECT_SOURCE_DIR}/tests/golden/model)

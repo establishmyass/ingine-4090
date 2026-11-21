@@ -143,6 +143,7 @@ ChatServer::ChatServer(model::Generator& generator, const text::ChatFormat& fmt,
       model_id_(options.model_id.empty() ? generator.model_id() : options.model_id),
       max_model_len_(options.max_model_len ? options.max_model_len : generator.max_model_len()),
       sampling_defaults_(options.sampling),
+      vision_(options.vision),
       created_(std::time(nullptr)),
       scheduler_(generator, fmt.stop_ids(), options.max_queue) {
   // A pool thread per connection, as ThreadingHTTPServer: the running request, the waiting ones, the ones
@@ -168,7 +169,8 @@ Json ChatServer::model_card() const {
               {"object", "model"},
               {"created", created_},
               {"owned_by", "ingine"},
-              {"max_model_len", max_model_len_}};
+              {"max_model_len", max_model_len_},
+              {"input_modalities", vision_ ? Json::array({"text", "image"}) : Json::array({"text"})}};
 }
 
 void ChatServer::handle_get(const httplib::Request& req, httplib::Response& res) {
@@ -211,7 +213,7 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
       return;
     }
     if (!body.is_object()) throw BadRequest("request body must be a JSON object");
-    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_);
+    request = parse_request(body, fmt_, max_model_len_, sampling_defaults_, vision_);
   } catch (const BadRequest& e) {
     send_error(res, e.status, e.what(), e.param);
     return;
@@ -223,7 +225,7 @@ void ChatServer::handle_post(const httplib::Request& req, httplib::Response& res
 }
 
 void ChatServer::complete(const httplib::Request& req, httplib::Response& res, ChatRequest request) {
-  auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling);
+  auto job = std::make_shared<engine::Job>(request.prompt_ids, request.max_new_tokens, request.sampling, request.images);
   if (!scheduler_.submit(job)) {
     res.set_header("Retry-After", "1");
     send_error(res, 503, "server busy: request queue is full");

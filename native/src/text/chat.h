@@ -92,8 +92,15 @@ std::vector<Delta> merge_deltas(const std::vector<Delta>& deltas);
 
 // chat.normalize_effort: null, a level name or a float in [0, 0.99]; throws ChatError(param "reasoning_effort").
 nlohmann::ordered_json normalize_effort(const nlohmann::ordered_json& effort);
-// chat.normalize_messages: OpenAI chat messages -> the shapes the checkpoint template expects.
+// chat.normalize_messages: OpenAI chat messages -> the shapes the checkpoint template expects. Content parts are
+// text or images (types image, input_image, image_url; the template renders an image as one
+// <|content_image|><|unused_200054|><|end_message|> block, for user and tool messages only).
 nlohmann::ordered_json normalize_messages(const nlohmann::ordered_json& messages);
+// Whether a content part is an image (type image, input_image or image_url).
+bool is_image_part(const nlohmann::ordered_json& part);
+// The image references of `messages` (data: URL or base64, as given) in the order the template renders their
+// placeholders. Throws ChatError for an image part without a reference.
+std::vector<std::string> image_sources(const nlohmann::ordered_json& messages);
 
 namespace detail {
 struct FormatData;

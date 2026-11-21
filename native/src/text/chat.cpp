@@ -257,6 +257,43 @@ Json normalize_effort(const Json& effort) {
   return Json(value.get<double>());
 }
 
+bool is_image_part(const Json& part) {
+  if (!part.is_object()) return false;
+  const Json* type = get(part, "type");
+  return type != nullptr && (*type == "image" || *type == "input_image" || *type == "image_url");
+}
+
+std::vector<std::string> image_sources(const Json& messages) {
+  std::vector<std::string> out;
+  if (!messages.is_array()) return out;
+  // the reference of an image part: OpenAI {"image_url": "..." | {"url": "..."}}, transformers {"image": "...",
+  // "url": "...", "base64": "..."}
+  auto ref = [](const Json& part) -> std::optional<std::string> {
+    for (const char* key : {"image_url", "image", "url", "base64"}) {
+      const Json* v = get(part, key);
+      if (v == nullptr || v->is_null()) continue;
+      if (v->is_string()) return v->get<std::string>();
+      if (v->is_object()) {
+        const Json* url = get(*v, "url");
+        if (url != nullptr && url->is_string()) return url->get<std::string>();
+      }
+      throw ChatError(std::string("image part field '") + key + "' must be a string or an object with 'url'");
+    }
+    return std::nullopt;
+  };
+  for (const Json& message : messages) {
+    const Json* content = message.is_object() ? get(message, "content") : nullptr;
+    if (content == nullptr || !content->is_array()) continue;
+    for (const Json& part : *content) {
+      if (!is_image_part(part)) continue;
+      std::optional<std::string> r = ref(part);
+      if (!r) throw ChatError("image content part without an image (expected 'image_url' with a data: URL)");
+      out.push_back(std::move(*r));
+    }
+  }
+  return out;
+}
+
 Json normalize_messages(const Json& messages) {
   if (!messages.is_array() || messages.empty()) throw ChatError("'messages' must be a non-empty list");
   Json out = Json::array();
@@ -278,8 +315,8 @@ Json normalize_messages(const Json& messages) {
       for (const Json& part : *content) {
         if (part.is_object()) {
           const Json* type = get(part, "type");
-          if (!is_none(type) && !(*type == "text" || *type == "input_text")) {
-            throw ChatError("unsupported content part type " + py::repr(*type) + " (text only)");
+          if (!is_none(type) && !(*type == "text" || *type == "input_text") && !is_image_part(part)) {
+            throw ChatError("unsupported content part type " + py::repr(*type) + " (text and images only)");
           }
         }
         if (!part.is_string() && !part.is_object()) throw ChatError("content parts must be strings or objects");

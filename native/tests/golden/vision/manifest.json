@@ -1,0 +1,26 @@
+[
+ {
+  "image": "gradient.ppm",
+  "rows": 2,
+  "cols": 3,
+  "pixels": "gradient.pixels.bf16",
+  "embeds": "gradient.embeds.f32",
+  "rms": 0.1724119285359415
+ },
+ {
+  "image": "alpha.png",
+  "rows": 1,
+  "cols": 2,
+  "pixels": "alpha.pixels.bf16",
+  "embeds": "alpha.embeds.f32",
+  "rms": 0.16608244158576904
+ },
+ {
+  "image": "noise.png",
+  "rows": 3,
+  "cols": 5,
+  "pixels": "noise.pixels.bf16",
+  "embeds": "noise.embeds.f32",
+  "rms": 0.5518751867905259
+ }
+]

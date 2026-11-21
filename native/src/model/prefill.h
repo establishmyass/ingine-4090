@@ -27,6 +27,14 @@ namespace ingine::model {
 // with T rows; projections are cuBLASLt BF16 GEMMs over the dequantized weight rows (weights.dequant), the
 // attention a flash-attention prefill kernel, the MoE grouped GEMMs over the experts decoded on the fly.
 // Stream-ordered on `stream`; run() only synchronises for its first use of a block-pointer table.
+// Chunk rows whose input embedding is given instead of embedded from their token (image tokens): row rows[i]
+// (chunk-relative, device int [n]) takes values[i] (device bf16 [n, H]) in place of the normed token embedding.
+struct RowOverride {
+  const int* rows = nullptr;
+  const __nv_bfloat16* values = nullptr;
+  int n = 0;
+};
+
 class Prefiller {
  public:
   Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream);
@@ -34,7 +42,8 @@ class Prefiller {
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
 
-  void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps);
+  void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
+           const RowOverride* override_rows = nullptr);
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object

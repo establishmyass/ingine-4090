@@ -1,6 +1,7 @@
 #include "serve/openai.h"
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -82,8 +83,109 @@ bool truthy(const Json& value) {
   }
 }
 
+namespace {
+
+int b64_value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+' || c == '-') return 62;
+  if (c == '/' || c == '_') return 63;
+  return -1;
+}
+
+std::vector<uint8_t> base64_decode(std::string_view s) {
+  std::vector<uint8_t> out;
+  out.reserve(s.size() / 4 * 3);
+  uint32_t acc = 0;
+  int bits = 0;
+  for (char c : s) {
+    if (c == '=') break;
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+    const int v = b64_value(c);
+    if (v < 0) throw vision::ImageError("image data is not valid base64");
+    acc = (acc << 6) | uint32_t(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(uint8_t(acc >> bits));
+      acc &= (1u << bits) - 1;
+    }
+  }
+  return out;
+}
+
+// Encodes the request's images and expands each placeholder token of `ids` into the image's tokens.
+std::vector<model::PromptImage> expand_images(const Json& messages, std::vector<int32_t>& ids,
+                                              vision::ImageEncoder* vision) {
+  const std::vector<std::string> sources = text::image_sources(messages);
+  if (sources.empty()) return {};
+  if (vision == nullptr)
+    throw BadRequest("this server does not accept images (no vision tower loaded)", "messages");
+  std::vector<vision::EncodedImage> encoded;
+  for (const std::string& src : sources) {
+    try {
+      encoded.push_back(vision->encode(decode_image_url(src)));
+    } catch (const vision::ImageError& e) {
+      throw BadRequest(std::string("invalid image: ") + e.what(), "messages");
+    } catch (const std::bad_alloc&) {
+      throw BadRequest("image encoding failed: out of memory", "messages", 500);
+    } catch (const std::runtime_error& e) {
+      throw BadRequest(std::string("image encoding failed: ") + e.what(), "messages", 500);
+    }
+  }
+  std::vector<model::PromptImage> images;
+  std::vector<int32_t> out;
+  std::size_t total = ids.size();
+  for (const auto& e : encoded) total += std::size_t(e.tokens()) - 1;
+  out.reserve(total);
+  for (int32_t id : ids) {
+    if (id != vision::kImageToken) {
+      out.push_back(id);
+      continue;
+    }
+    if (images.size() == encoded.size()) throw BadRequest("more image placeholders than images", "messages");
+    const vision::EncodedImage& e = encoded[images.size()];
+    images.push_back({int(out.size()), e.tokens(), e.hash, e.embeds});
+    out.insert(out.end(), std::size_t(e.tokens()), vision::kImageToken);
+  }
+  if (images.size() != encoded.size()) throw BadRequest("image placeholders do not match the images", "messages");
+  ids = std::move(out);
+  return images;
+}
+
+}  // namespace
+
+std::vector<uint8_t> decode_image_url(const std::string& url) {
+  std::string_view s(url);
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
+  auto starts = [&](std::string_view p) {
+    if (s.size() < p.size()) return false;
+    for (std::size_t i = 0; i < p.size(); ++i)
+      if (std::tolower(static_cast<unsigned char>(s[i])) != p[i]) return false;
+    return true;
+  };
+  if (starts("data:")) {
+    const std::size_t comma = s.find(',');
+    if (comma == std::string_view::npos) throw vision::ImageError("malformed data: URL");
+    if (s.substr(5, comma - 5).find(";base64") == std::string_view::npos)
+      throw vision::ImageError("data: URLs must be base64 encoded (data:image/...;base64,...)");
+    std::vector<uint8_t> bytes = base64_decode(s.substr(comma + 1));
+    if (bytes.empty()) throw vision::ImageError("the data: URL holds no data");
+    return bytes;
+  }
+  if (starts("http://") || starts("https://") || starts("file:") || starts("ftp://"))
+    throw vision::ImageError("send images as data: URLs (base64); this server does not fetch URLs or files");
+  if (s.empty()) throw vision::ImageError("empty image reference");
+  try {
+    return base64_decode(s);  // bare base64 (transformers {"type": "image", "image": "<base64>"})
+  } catch (const vision::ImageError&) {
+    throw vision::ImageError("unsupported image reference: expected a data: URL (base64)");
+  }
+}
+
 ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
-                          const model::Sampling& defaults) {
+                          const model::Sampling& defaults, vision::ImageEncoder* vision) {
   if (num_int(body, "n", Bound{1, "1"}, Bound{1, "1"}).value_or(1) != 1) {
     throw BadRequest("only n=1 is supported", "n");
   }
@@ -116,6 +218,8 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   static const Json kAbsent;  // null: no messages/tools key (passed by reference, not a deep copy of the body)
   text::RenderedPrompt prompt = fmt.render(messages == body.end() ? kAbsent : *messages,
                                            tools == body.end() ? kAbsent : *tools, options);
+  std::vector<model::PromptImage> images =
+      expand_images(messages == body.end() ? kAbsent : *messages, prompt.ids, vision);
 
   const int64_t room = int64_t(max_model_len) - int64_t(prompt.ids.size());
   if (room <= 0) {
@@ -156,6 +260,7 @@ ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max
   req.max_new_tokens = int(std::min(max_tokens.value_or(room), room));
   req.prompt_ids = std::move(prompt.ids);
   req.prefill_ids = std::move(prompt.prefill_ids);
+  req.images = std::move(images);
   return req;
 }
 

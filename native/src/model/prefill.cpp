@@ -104,7 +104,8 @@ const float* const* Prefiller::block_table(const std::vector<const float*>& bloc
   return static_cast<const float* const*>(it->second.p);
 }
 
-void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps) {
+void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
+                    const RowOverride* override_rows) {
   if (T < 1 || T > max_chunk_) throw std::invalid_argument("Prefiller::run: T outside 1..max_chunk");
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
@@ -161,6 +162,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
 
   pk::widen_ids(tokens, T, ids_, s);
   dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
+  // image tokens: the vision tower's embeddings replace the normed token embeddings (masked_scatter)
+  if (override_rows && override_rows->n > 0)
+    pk::set_rows(override_rows->rows, override_rows->values, override_rows->n, B0_, s);
   int prev_v = -1;
   int tap = 0;
 

@@ -37,7 +37,8 @@ class RoundGenerator final : public ingine::model::Generator {
   std::string model_id() const override { return "round"; }
   int max_model_len() const override { return 1 << 20; }
   GenerateStats generate(std::span<const int32_t> prompt, int, const Sampling&, std::span<const int32_t>,
-                         const std::function<bool(std::span<const int32_t>)>& on_tokens) override {
+                         const std::function<bool(std::span<const int32_t>)>& on_tokens,
+                         std::span<const ingine::model::PromptImage> = {}) override {
     if (!prompt.empty() && prompt[0] < 0) throw std::invalid_argument("prompt does not fit");
     order.push_back(prompt.empty() ? -1 : prompt[0]);
     for (int32_t next = 100;; next += round_) {

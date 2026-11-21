@@ -3,6 +3,7 @@
 #include "engine/fake_generator.h"
 #include "engine/log.h"
 #include "ingine/generator.h"
+#include "ingine/vision.h"
 #include "serve/chat_server.h"
 #include "serve/cli.h"
 #include "text/chat.h"
@@ -80,6 +81,8 @@ int main(int argc, char** argv) {
   double offload_experts = 0.0;
   int offload_threads = 8;
   bool offload_static = false;
+  bool no_vision = false;
+  int vision_threads = 0, image_max_tokens = 1024;
   // sampling defaults; negative: from generation_config.json
   double temperature = -1, top_p = -1;
   int top_k = -1;
@@ -98,6 +101,10 @@ int main(int argc, char** argv) {
   ap.option("--offload-experts", "GIB", "keep GIB of routed experts only in host memory (RAM) to free VRAM", &offload_experts);
   ap.option("--offload-threads", "N", "CPU threads computing offloaded experts during decode (0: GPU reads them over PCIe)", &offload_threads);
   ap.flag("--offload-static", "keep the starting expert placement (no adaptive swaps)", &offload_static);
+  ap.flag("--no-vision", "do not load the vision tower (requests with images get 400)", &no_vision);
+  ap.option("--vision-threads", "N", "CPU threads encoding images (0: one per physical core)", &vision_threads);
+  ap.option("--image-max-tokens", "N",
+            "image tokens per image (40x40 px each, at most 4096); larger images are downscaled", &image_max_tokens);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
@@ -156,7 +163,27 @@ int main(int argc, char** argv) {
 #endif
     }
 
+    // Image input: the vision tower runs on the CPU (no VRAM); its weights load on a background thread, so the
+    // server is ready as before and the first image request waits for them if it comes early.
+    std::unique_ptr<ingine::vision::ImageEncoder> vision;
+#ifdef INGINE_WITH_VISION
+    if (engine && !no_vision) {
+      if (!ingine::vision::has_vision_tower(model_dir))
+        log.info("vision: no vision tower in {}; image input off", model_dir);
+      else if (!ingine::vision::vision_supported())
+        log.warn("vision: this CPU lacks AVX-512 BF16; image input off");
+      else {
+        ingine::vision::VisionOptions vo;
+        vo.model_dir = model_dir;
+        vo.threads = vision_threads;
+        vo.max_tokens = image_max_tokens;
+        vision = ingine::vision::make_image_encoder(vo);
+      }
+    }
+#endif
+
     ingine::serve::ServerOptions server_options;
+    server_options.vision = vision.get();
     server_options.max_queue = max_queue;
     server_options.max_model_len = max_model_len;
     server_options.model_id = model_id;

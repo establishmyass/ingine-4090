@@ -38,6 +38,13 @@ const RuntimeOptions& without_spec(const RuntimeOptions& options) {
   return options;
 }
 
+// An image of a prompt held in the state (positions, size, content hash).
+struct ImageKey {
+  int pos = 0, tokens = 0;
+  std::uint64_t hash = 0;
+  bool operator==(const ImageKey&) const = default;
+};
+
 class EngineGenerator final : public Generator {
  public:
   explicit EngineGenerator(const RuntimeOptions& options)
@@ -102,9 +109,18 @@ class EngineGenerator final : public Generator {
  public:
   GenerateStats generate(std::span<const std::int32_t> prompt, int max_new_tokens, const Sampling& sampling,
                          std::span<const std::int32_t> stop_ids,
-                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens) override {
+                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                         std::span<const PromptImage> images = {}) override {
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
     const int n = int(prompt.size());
+    for (std::size_t i = 0; i < images.size(); ++i) {
+      const PromptImage& im = images[i];
+      const bool overlaps = i > 0 && im.pos < images[i - 1].pos + images[i - 1].tokens;
+      if (im.tokens < 1 || im.pos < 0 || im.pos + im.tokens > n || overlaps)
+        throw std::invalid_argument("image spans must be ordered, disjoint and inside the prompt");
+      if (!im.embeds || im.embeds->size() != std::size_t(im.tokens) * HIDDEN)
+        throw std::invalid_argument("image embeddings must be [tokens, 2304]");
+    }
     if (!sampling.forced.empty()) max_new_tokens = std::min(max_new_tokens, int(sampling.forced.size()));
     // a verify call writes up to max(verify widths) positions
     const int reserve = drafter_ ? *std::max_element(rt_.verify_widths().begin(), rt_.verify_widths().end()) : 0;
@@ -121,7 +137,7 @@ class EngineGenerator final : public Generator {
 
     auto t = std::chrono::steady_clock::now();
     try {
-      prefill(prompt, stats);
+      prefill(prompt, images, stats);
       if (boot_trace_enabled()) {
         CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
         spdlog::info("request: prefill of {} tokens {:.1f} ms", n, seconds_since(t) * 1e3);
@@ -161,6 +177,8 @@ class EngineGenerator final : public Generator {
     cudaStreamSynchronize(rt_.stream());
     tokens_in_state_.clear();
     checkpoint_ids_.clear();
+    state_images_.clear();
+    checkpoint_images_.clear();
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
@@ -224,19 +242,22 @@ class EngineGenerator final : public Generator {
   //   prefix of `ids`: restore it and prefill the rest. This is the agent-loop case: the next prompt
   //   re-renders the previous answer differently from the tokens the model generated.
   // * None: reset and prefill everything.
-  // After a prefill the checkpoint moves to the end of `ids`.
-  void prefill(std::span<const std::int32_t> ids, GenerateStats& stats) {
+  // After a prefill the checkpoint moves to the end of `ids`. Images take part in the prefix comparison: a reused
+  // prefix must hold the same images (positions, sizes, content hashes) as the new prompt's first `prefix` tokens.
+  void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats) {
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
     const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
     std::size_t start = 0;
-    if (drafter_in_step && !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin())) {
+    if (drafter_in_step && !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin()) &&
+        same_images(state_images_, images, prev.size())) {
       start = prev.size();
       stats.reuse = Reuse::Extend;
     } else if (!checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
-               std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin())) {
+               std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin()) &&
+               same_images(checkpoint_images_, images, checkpoint_ids_.size())) {
       restore_checkpoint();
       start = checkpoint_ids_.size();
       stats.reuse = Reuse::Checkpoint;
@@ -244,6 +265,7 @@ class EngineGenerator final : public Generator {
       reset_state(st, stream);
       if (drafter_) drafter_->reset();
       tokens_in_state_.clear();
+      state_images_.clear();
       stats.reuse = Reuse::None;
     }
     st.length = int(start);  // decode steps advance the state without its host-side length
@@ -254,14 +276,17 @@ class EngineGenerator final : public Generator {
                                  cudaMemcpyHostToDevice, stream));
       Tensor taps;
       if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
+      const RowOverride rows = image_rows(images, int(s), T);
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr);
+                     drafter_ ? &taps : nullptr, rows.n ? &rows : nullptr);
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));
       }
     }
     tokens_in_state_.assign(ids.begin(), ids.end());
+    state_images_.clear();
+    for (const PromptImage& im : images) state_images_.push_back({im.pos, im.tokens, im.hash});
     if (start < n) save_checkpoint();
     stats.reused_tokens = int(start);
   }
@@ -275,6 +300,7 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
+    checkpoint_images_ = state_images_;
   }
 
   void restore_checkpoint() {
@@ -284,6 +310,46 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
                                rt_.stream()));
     tokens_in_state_ = checkpoint_ids_;
+    state_images_ = checkpoint_images_;
+  }
+
+  // Whether `held` (the images of a state holding `prefix` tokens) are exactly the images among the first
+  // `prefix` tokens of a prompt with images `req`.
+  static bool same_images(const std::vector<ImageKey>& held, std::span<const PromptImage> req, std::size_t prefix) {
+    std::size_t i = 0;
+    for (const PromptImage& im : req) {
+      if (std::size_t(im.pos) >= prefix) break;
+      if (i >= held.size() || !(held[i] == ImageKey{im.pos, im.tokens, im.hash})) return false;
+      ++i;
+    }
+    return i == held.size();
+  }
+
+  // The image rows of prompt chunk [s, s + T): their embeddings uploaded (pageable copies, staged before the
+  // calls return) into the override buffers, which the previous chunk's prefill has finished reading in stream
+  // order.
+  RowOverride image_rows(std::span<const PromptImage> images, int s, int T) {
+    RowOverride ov;
+    std::vector<int> rows;
+    for (const PromptImage& im : images) {
+      const int a = std::max(im.pos, s), b = std::min(im.pos + im.tokens, s + T);
+      if (a >= b) continue;
+      if (!image_vals_.p) {
+        image_vals_ = DeviceBuffer(std::size_t(options_.prefill_chunk) * HIDDEN * 2);
+        image_rows_ = DeviceBuffer(std::size_t(options_.prefill_chunk) * sizeof(int));
+      }
+      CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(image_vals_.p) + rows.size() * HIDDEN,
+                                 im.embeds->data() + std::size_t(a - im.pos) * HIDDEN,
+                                 std::size_t(b - a) * HIDDEN * 2, cudaMemcpyHostToDevice, rt_.stream()));
+      for (int r = a; r < b; ++r) rows.push_back(r - s);
+    }
+    if (rows.empty()) return ov;
+    CUDA_CHECK(cudaMemcpyAsync(image_rows_.p, rows.data(), rows.size() * sizeof(int), cudaMemcpyHostToDevice,
+                               rt_.stream()));
+    ov.rows = static_cast<const int*>(image_rows_.p);
+    ov.values = static_cast<const __nv_bfloat16*>(image_vals_.p);
+    ov.n = int(rows.size());
+    return ov;
   }
 
   static std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
@@ -316,6 +382,8 @@ class EngineGenerator final : public Generator {
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
+  std::vector<ImageKey> state_images_, checkpoint_images_;  // images in the state / the checkpoint
+  DeviceBuffer image_vals_, image_rows_;  // a chunk's image embeddings (bf16 [chunk, H]) and their rows
   std::mutex mutex_;
 };
 

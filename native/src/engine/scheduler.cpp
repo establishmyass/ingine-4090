@@ -35,9 +35,11 @@ std::string type_name(const std::exception& e) {
 
 }  // namespace
 
-Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_)
+Job::Job(std::vector<int32_t> prompt_ids_, int max_new_tokens_, model::Sampling sampling_,
+         std::vector<model::PromptImage> images_)
     : id("chatcmpl-" + random_hex32()),
       prompt_ids(std::move(prompt_ids_)),
+      images(std::move(images_)),
       max_new_tokens(max_new_tokens_),
       sampling(sampling_),
       t_submit(Clock::now()) {}
@@ -178,7 +180,7 @@ void Scheduler::run(Job& job) {
   };
   try {
     const model::GenerateStats st =
-        generator_.generate(job.prompt_ids, job.max_new_tokens, job.sampling, stop_list_, on_tokens);
+        generator_.generate(job.prompt_ids, job.max_new_tokens, job.sampling, stop_list_, on_tokens, job.images);
     // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
     server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
                       st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);

@@ -123,6 +123,8 @@ report the state.
 * `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (the chat template maps them to
   0, 0.1, 0.2, 0.7, 0.9, 0.99, 0.99) or a number from 0 to 0.99; the template's default is 0.9.
 * `enable_thinking: false` to answer without reasoning (also accepted in `chat_template_kwargs`).
+* images: `image_url` content parts with base64 `data:` URLs (encoded on the CPU, see
+  [IMAGE-INPUT.md](IMAGE-INPUT.md)).
 * `tools` (function calling through the model's chat template), `stop`, `max_tokens` / `max_completion_tokens`,
   `temperature` (default 1; 0 is greedy), `top_p`, `top_k`, `seed`.
 * `stream: true` for server-sent events; reasoning arrives as `reasoning_content` deltas before the answer's

@@ -34,10 +34,12 @@ struct JobBatch {
 
 class Job {
  public:
-  Job(std::vector<int32_t> prompt_ids, int max_new_tokens, model::Sampling sampling);
+  Job(std::vector<int32_t> prompt_ids, int max_new_tokens, model::Sampling sampling,
+      std::vector<model::PromptImage> images = {});
 
   const std::string id;  // "chatcmpl-" + 32 hex digits
   const std::vector<int32_t> prompt_ids;
+  const std::vector<model::PromptImage> images;  // image spans of prompt_ids (embeddings already encoded)
   const int max_new_tokens;
   const model::Sampling sampling;
   const Clock::time_point t_submit;

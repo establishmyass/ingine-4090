@@ -271,6 +271,16 @@ __global__ void widen_kernel(const int32_t* __restrict__ in, int T, int64_t* __r
   if (i < T) out[i] = in[i];
 }
 
+// out[rows[i]] = float(src[i]): image embeddings replacing token embeddings (bf16 [n, H] -> fp32 rows)
+__global__ void __launch_bounds__(ROW_T) set_rows_kernel(const int* __restrict__ rows, const uint16_t* __restrict__ src,
+                                                         float* __restrict__ out) {
+  const int i = blockIdx.x, c = threadIdx.x * 4;
+  const uint2 v = *reinterpret_cast<const uint2*>(src + size_t(i) * H + c);
+  const float4 f = make_float4(__uint_as_float(v.x << 16), __uint_as_float(v.x & 0xffff0000u),
+                               __uint_as_float(v.y << 16), __uint_as_float(v.y & 0xffff0000u));
+  *reinterpret_cast<float4*>(out + size_t(rows[i]) * H + c) = f;
+}
+
 __global__ void __launch_bounds__(ROW_T) tap_kernel(const float* __restrict__ x, uint16_t* __restrict__ out,
                                                     int64_t stride) {
   const int t = blockIdx.x, c = threadIdx.x * 4;
@@ -353,6 +363,10 @@ void gate_apply(const float* h, const float* msg, const float* f, const float* g
 
 void widen_ids(const int32_t* in, int T, int64_t* out, cudaStream_t stream) {
   widen_kernel<<<(T + 255) / 256, 256, 0, stream>>>(in, T, out);
+}
+
+void set_rows(const int* rows, const __nv_bfloat16* src, int n, float* out, cudaStream_t stream) {
+  if (n > 0) set_rows_kernel<<<n, ROW_T, 0, stream>>>(rows, reinterpret_cast<const uint16_t*>(src), out);
 }
 
 void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream) {

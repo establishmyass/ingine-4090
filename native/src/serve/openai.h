@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ingine/generator.h"
+#include "ingine/vision.h"
 #include "text/chat.h"
 
 #include <nlohmann/json.hpp>
@@ -29,6 +30,7 @@ struct BadRequest : std::runtime_error {
 struct ChatRequest {
   std::vector<int32_t> prompt_ids;   // full prompt, prefill included
   std::vector<int32_t> prefill_ids;  // tail of prompt_ids the model would otherwise have generated
+  std::vector<model::PromptImage> images;  // image spans of prompt_ids with their embeddings
   int max_new_tokens = 0;
   model::Sampling sampling;
   std::vector<std::string> stop;
@@ -37,9 +39,12 @@ struct ChatRequest {
 };
 
 // Validates `body` (a JSON object) and renders the prompt. Throws BadRequest or text::ChatError. Sampling fields
-// the request omits (temperature, top_p, top_k) take their values from `defaults`.
+// the request omits (temperature, top_p, top_k) take their values from `defaults`. Image content parts are
+// encoded with `vision` (null: images are rejected) and each placeholder expanded to the image's tokens.
 ChatRequest parse_request(const Json& body, const text::ChatFormat& fmt, int max_model_len,
-                          const model::Sampling& defaults = {});
+                          const model::Sampling& defaults = {}, vision::ImageEncoder* vision = nullptr);
+// "data:image/...;base64,...." or bare base64 -> bytes. Throws vision::ImageError (remote URLs are not fetched).
+std::vector<uint8_t> decode_image_url(const std::string& url);
 
 // {"error": {"message", "type", "param", "code"}} with the type server.py maps from the status.
 Json error_body(int status, std::string_view message, const std::optional<std::string>& param = std::nullopt);

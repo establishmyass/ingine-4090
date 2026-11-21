@@ -3903,7 +3903,7 @@
   }
  },
  {
-  "note": "image part -> ChatError",
+  "note": "image part -> one placeholder block",
   "messages": [
    {
     "role": "user",
@@ -3921,8 +3921,131 @@
   "reasoning_effort": null,
   "enable_thinking": true,
   "kwargs": {},
+  "result": {
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ],
+   "prefill_ids": []
+  }
+ },
+ {
+  "tools": null,
+  "reasoning_effort": null,
+  "enable_thinking": true,
+  "kwargs": {},
+  "note": "text and image parts (image, input_image) -> placeholders in order",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is this?"
+     },
+     {
+      "type": "image",
+      "image": "x"
+     },
+     {
+      "type": "input_image",
+      "image_url": "y"
+     }
+    ]
+   }
+  ],
+  "result": {
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is this?<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    1775,
+    149884,
+    149928,
+    30,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ],
+   "prefill_ids": []
+  }
+ },
+ {
+  "tools": null,
+  "reasoning_effort": null,
+  "enable_thinking": true,
+  "kwargs": {},
+  "note": "image in an assistant message -> template error",
+  "messages": [
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "x"
+      }
+     }
+    ]
+   }
+  ],
   "error": {
-   "message": "unsupported content part type 'image_url' (text only)",
+   "message": "chat template error: Image content is only supported for user and tool messages",
+   "param": "messages"
+  }
+ },
+ {
+  "tools": null,
+  "reasoning_effort": null,
+  "enable_thinking": true,
+  "kwargs": {},
+  "note": "audio part -> ChatError",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "input_audio",
+      "input_audio": {}
+     }
+    ]
+   }
+  ],
+  "error": {
+   "message": "unsupported content part type 'input_audio' (text and images only)",
    "param": "messages"
   }
  },

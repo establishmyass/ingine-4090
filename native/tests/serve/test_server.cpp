@@ -628,6 +628,84 @@ void test_invalid_json() {
   CHECK(r.status == 400 && Json::parse(r.body)["error"]["message"] == "request body must be a JSON object");
 }
 
+// Image parts: data: URLs decoded and encoded (a stub encoder: the first two bytes are the token grid), each
+// placeholder expanded to its image's tokens with the spans passed to the generator; bad images are 400s.
+struct StubEncoder final : ingine::vision::ImageEncoder {
+  std::atomic<int> calls{0};
+  ingine::vision::EncodedImage encode(std::span<const std::uint8_t> file) override {
+    ++calls;
+    if (file.size() < 3) throw ingine::vision::ImageError("cannot decode image");
+    ingine::vision::EncodedImage e;
+    e.rows = file[0], e.cols = file[1], e.hash = file[2];
+    e.embeds = std::make_shared<const std::vector<std::uint16_t>>(std::size_t(e.rows) * e.cols * 2304, 0);
+    return e;
+  }
+  int tokens_for(int, int) const override { return 0; }
+};
+
+std::string b64(const std::vector<std::uint8_t>& bytes) {
+  static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const std::uint32_t v = std::uint32_t(bytes[i]) << 16 | (i + 1 < bytes.size() ? bytes[i + 1] << 8 : 0) |
+                            (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+    out += t[v >> 18], out += t[(v >> 12) & 63];
+    out += i + 1 < bytes.size() ? t[(v >> 6) & 63] : '=';
+    out += i + 2 < bytes.size() ? t[v & 63] : '=';
+  }
+  return out;
+}
+
+void test_images() {
+  StubEncoder enc;
+  auto gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test", 1 << 20,
+                                             [](std::span<const int32_t>) { return FakeGenerator::Output(THINK_TEXT); });
+  ingine::serve::ServerOptions options;
+  options.vision = &enc;
+  ChatServer srv(*gen, *g_fmt, options);
+  CHECK(srv.bind("127.0.0.1", 0));
+  srv.start();
+  const Json card = Json::parse(request(srv.port(), "GET", "/v1/models").body)["data"][0];
+  CHECK((card["input_modalities"] == Json::array({"text", "image"})));
+  const Json msgs = Json::array(
+      {{{"role", "user"},
+        {"content", Json::array({{{"type", "text"}, {"text", "Compare"}},
+                                 {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64," + b64({2, 3, 7})}}}},
+                                 {{"type", "input_image"}, {"image_url", "data:image/jpeg;base64," + b64({1, 1, 9})}}})}}});
+  Chat r = chat(srv.port(), {{"messages", msgs}});
+  CHECK(r.status == 200);
+  const auto calls = gen->calls();
+  CHECK(calls.size() == 1 && calls[0].images.size() == 2);
+  const std::vector<int32_t> rendered = render(msgs).ids;
+  const auto& ids = calls[0].prompt_ids;
+  CHECK(ids.size() == rendered.size() + 5 && r.body["usage"]["prompt_tokens"] == ids.size());
+  const auto& a = calls[0].images[0];
+  const auto& b = calls[0].images[1];
+  CHECK(a.tokens == 6 && a.hash == 7 && b.tokens == 1 && b.hash == 9 && a.pos + 6 < b.pos);
+  for (int i = 0; i < int(ids.size()); ++i) {
+    const bool in = (i >= a.pos && i < a.pos + 6) || i == b.pos;
+    CHECK((ids[std::size_t(i)] == 200054) == in);
+  }
+  CHECK(ids[std::size_t(a.pos) - 1] == 200005 && ids[std::size_t(a.pos) + 6] == 200010);  // <|content_image|> .. <|end_message|>
+  // errors: remote URL, undecodable data, image in an assistant message
+  const auto bad = [&](const Json& part, const std::string& role = "user") {
+    return chat(srv.port(), {{"messages", Json::array({{{"role", role}, {"content", Json::array({part})}}})}});
+  };
+  Chat e = bad({{"type", "image_url"}, {"image_url", {{"url", "https://example.com/cat.png"}}}});
+  CHECK(e.status == 400 && e.body["error"]["param"] == "messages" &&
+        e.body["error"]["message"].get<std::string>().find("data: URL") != std::string::npos);
+  e = bad({{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64," + b64({1})}}}});
+  CHECK(e.status == 400 && e.body["error"]["message"] == "invalid image: cannot decode image");
+  e = bad({{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,@@@"}}}});
+  CHECK(e.status == 400);
+  e = bad({{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64," + b64({1, 1, 1})}}}}, "assistant");
+  CHECK(e.status == 400);
+  e = bad({{"type", "image_url"}});
+  CHECK(e.status == 400);
+  CHECK(gen->calls().size() == 1);
+  srv.stop();
+}
+
 // The default responder: echo, tool call, thinking disabled.
 void test_echo() {
   auto gen = std::make_unique<FakeGenerator>(g_fmt->tokenizer(), "inkling-test");
@@ -681,6 +759,7 @@ int main() {
       {"bad_requests", test_bad_requests},
       {"invalid_json", test_invalid_json},
       {"echo", test_echo},
+      {"images", test_images},
   };
   int failed = 0;
   for (const auto& [name, fn] : tests) {

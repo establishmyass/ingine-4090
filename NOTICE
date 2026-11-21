@@ -52,6 +52,17 @@ fngine's hot/cold expert tiers. No Strata source file is copied verbatim; the
 adapted code is new and marked with references in its comments. Strata's
 copyright and MIT license notice: native/src/offload/LICENSE.strata.
 
+Image input (native/src/vision, branch rtx3090)
+-----------------------------------------------
+The image preprocessing and the vision tower follow Hugging Face transformers'
+Inkling 2 implementation (image_processing_inkling2.py, modeling_inkling2.py,
+vision_utils.py; Apache License 2.0), cross-checked against llama.cpp's
+inkling2v graph and preprocessor (MIT License). The vector erf uses the
+rational approximation coefficients of Eigen's / XLA's generic_fast_erf_float
+(Eigen: MPL 2.0; the coefficients are numerical constants). No source file is
+copied; tools/vision_reference.py is a NumPy port of the transformers code
+used as a test oracle.
+
 Vendored dependencies in native/third_party retain their original copyright
 and license notices:
 - cpp-httplib: native/third_party/cpp-httplib/LICENSE
@@ -62,6 +73,9 @@ and license notices:
   native/third_party/llama-jinja/UNICODE-LICENSE.
 - nlohmann/json: native/third_party/nlohmann/LICENSE.MIT
   Copyright (c) 2013-2025 Niels Lohmann; MIT License.
+- stb_image v2.32 (from llama.cpp's vendor/stb): native/third_party/stb/LICENSE
+  Copyright (c) 2017 Sean Barrett; MIT License or public domain (Unlicense),
+  at the user's choice.
 - spdlog: native/third_party/spdlog/LICENSE
   Copyright (c) 2016 - present, Gabi Melman and spdlog contributors; MIT
   License. Its bundled fmt code also retains its own copyright and MIT license

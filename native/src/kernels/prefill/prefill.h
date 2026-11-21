@@ -169,6 +169,9 @@ void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat
 
 // int32 -> int64 token ids.
 void widen_ids(const int32_t* in, int T, int64_t* out, cudaStream_t stream);
+// out[rows[i]] = float(src[i]) for i < n: src bf16 [n, H], out fp32 [., H] (image embeddings over the token
+// embeddings).
+void set_rows(const int* rows, const __nv_bfloat16* src, int n, float* out, cudaStream_t stream);
 // out[t * out_stride] = bf16(x[t]) per row, x fp32 [T, H] (DSpark taps).
 void store_tap(const float* x, int T, __nv_bfloat16* out, int64_t out_stride, cudaStream_t stream);
 // model.logits for one row: out[v] = 30 tanh(bf16(w_v . x) / 30), w bf16 [V, H] or FP8 rows dequantized
