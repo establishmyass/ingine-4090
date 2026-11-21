@@ -23,7 +23,7 @@ std::size_t align_huge(std::size_t bytes) {
 
 } // namespace
 
-HostRegion::HostRegion(std::size_t bytes) {
+HostRegion::HostRegion(std::size_t bytes, bool huge) {
     if (bytes == 0) { throw std::invalid_argument("HostRegion size must be nonzero"); }
     const std::size_t size = align_huge(bytes);
     // Over-map by one huge page so the region can start on a 2 MiB boundary, then trim.
@@ -42,7 +42,7 @@ HostRegion::HostRegion(std::size_t bytes) {
     if (tail) { ::munmap(reinterpret_cast<void*>(aligned + size), tail); }
     data_ = reinterpret_cast<std::byte*>(aligned);
     size_ = size;
-    if (::madvise(data_, size_, MADV_HUGEPAGE) != 0) {
+    if (huge && ::madvise(data_, size_, MADV_HUGEPAGE) != 0) {
         spdlog::warn("HostRegion: madvise(MADV_HUGEPAGE) failed: {}", std::strerror(errno));
     }
 }
@@ -111,7 +111,7 @@ void HostRegion::release() noexcept {
     size_ = 0;
 }
 
-MappedHostBuffer::MappedHostBuffer(std::size_t bytes) {
+MappedHostBuffer::MappedHostBuffer(std::size_t bytes, bool zero) {
     if (bytes == 0) { throw std::invalid_argument("MappedHostBuffer size must be nonzero"); }
     void* ptr       = nullptr;
     cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
@@ -126,7 +126,7 @@ MappedHostBuffer::MappedHostBuffer(std::size_t bytes) {
         throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") +
                                  cudaGetErrorString(err));
     }
-    std::memset(ptr, 0, bytes);
+    if (zero) std::memset(ptr, 0, bytes);
     data_   = ptr;
     device_ = dev;
     size_   = bytes;

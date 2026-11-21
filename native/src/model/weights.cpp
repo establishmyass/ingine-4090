@@ -6,15 +6,20 @@
 //
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
+#include "core/boot_trace.h"
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "core/file_read.h"
 #include "core/safetensors.h"
 #include "kernels/dense/dense.h"
 
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <thread>
+#include <unistd.h>
+#include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -349,6 +354,16 @@ bool embed_in_host_memory() {
 
 Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
                      const offload::OffloadOptions& offload) {
+  // The drafter (mtp.safetensors) loads after the target weights; read it into the page cache meanwhile, so
+  // its load is not a cold read on the critical path. Best effort, detached: the kernel does the work.
+  if (const fs::path mtp = model_dir / "mtp.safetensors"; fs::exists(mtp))
+    std::thread([mtp] {
+      const int fd = ::open(mtp.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+        ::close(fd);
+      }
+    }).detach();
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
@@ -358,10 +373,16 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
   std::vector<offload::LayerExperts> host_experts(offload.enabled() ? LAYERS : 0);
+  BootPhase layers_phase("weights: 24 layers");
   for (int l = 0; l < LAYERS; ++l)
     w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8,
                                        offload.enabled() ? &host_experts[l] : nullptr));
-  if (offload.enabled()) w.store = std::make_shared<offload::ExpertStore>(m, host_experts, offload, stream);
+  layers_phase.done();
+  if (offload.enabled()) {
+    BootPhase p("weights: expert store");
+    w.store = std::make_shared<offload::ExpertStore>(m, host_experts, offload, stream);
+  }
+  BootPhase tail_phase("weights: embed, head, rest");
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -380,10 +401,13 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   if (embed_in_host_memory()) {
     // Read straight from the file into pinned, device-mapped host memory: the same BF16 rows, fetched by
     // the embed kernels (decode, prefill, drafter) over PCIe, one 4.6 KB row per token.
+    // parallel reads (O_DIRECT when cold) straight into the pinned buffer, at the file offset's 4 KiB phase
     const SafetensorsRef ref = m.at("model.llm.embed.weight");
-    w.embed_host = MappedHostBuffer(ref->bytes);
-    ref.file->read_range(ref->offset, ref->bytes, w.embed_host.data());
-    w.embed = ref->view(w.embed_host.device_ptr());
+    const std::size_t at = aligned_layout(0, ref->offset);
+    w.embed_host = MappedHostBuffer(at + ref->bytes + kDirectAlign, /*zero=*/false);
+    const ReadRange range{ref.file, ref->offset, ref->bytes, static_cast<std::byte*>(w.embed_host.data()) + at};
+    read_ranges(std::span<const ReadRange>(&range, 1), 16);
+    w.embed = ref->view(static_cast<char*>(w.embed_host.device_ptr()) + at);
   } else {
     w.embed = ld.raw("model.llm.embed.weight");
   }

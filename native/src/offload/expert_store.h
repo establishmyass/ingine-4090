@@ -113,7 +113,7 @@ class ExpertStore {
   std::array<int, kLayers> cls_of_{};            // 0 NVFP4, 1 MXFP8
   std::array<Class, 2> cls_;
   HostRegion host_;
-  std::array<std::size_t, kLayers> layer_off_{};  // byte offset of the layer's four stacked tensors
+  std::array<std::array<std::size_t, 4>, kLayers> toff_{};  // host offset of each layer's four stacked tensors
   std::vector<int> slot_of_;                      // pair -> slot (-1: host)
   std::vector<std::uint8_t> pending_;             // pair in a pending swap
   std::vector<double> score_;

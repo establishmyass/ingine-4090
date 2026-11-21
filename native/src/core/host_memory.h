@@ -17,7 +17,10 @@ class HostRegion {
 public:
     HostRegion() noexcept = default;
     // Maps align_up(bytes, 2 MiB) bytes. Pages are not touched (no prefault).
-    explicit HostRegion(std::size_t bytes);
+    // huge: advise MADV_HUGEPAGE. Faulting huge pages in stalls in memory compaction when RAM is fragmented
+    // (THP defrag "madvise": ~1-6 GB/s against ~30 GB/s for 4 KiB pages faulted on 16 threads), so regions
+    // filled at startup may prefer 4 KiB pages (startup time over TLB reach).
+    explicit HostRegion(std::size_t bytes, bool huge = true);
     ~HostRegion();
 
     HostRegion(const HostRegion&)            = delete;
@@ -53,7 +56,7 @@ private:
 class MappedHostBuffer {
 public:
     MappedHostBuffer() noexcept = default;
-    explicit MappedHostBuffer(std::size_t bytes);
+    explicit MappedHostBuffer(std::size_t bytes, bool zero = true);  // zero = false: contents undefined
     ~MappedHostBuffer();
 
     MappedHostBuffer(const MappedHostBuffer&)            = delete;

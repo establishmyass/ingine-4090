@@ -1,5 +1,9 @@
 #include "core/safetensors.h"
 
+#include "core/file_read.h"
+#include <cstdlib>
+#include <map>
+
 #include "core/nvtx.h"
 
 #include <nlohmann/json.hpp>
@@ -383,12 +387,14 @@ DeviceUploader::DeviceUploader(UploadOptions options) : options_(options) {
     if (options_.chunk_bytes > std::numeric_limits<std::size_t>::max() / n) {
         throw std::invalid_argument("DeviceUploader: staging size overflows");
     }
-    cuda_throw(cudaHostAlloc(&pinned_, options_.chunk_bytes * n, cudaHostAllocPortable),
+    // each buffer holds a chunk's 4 KiB-aligned superset for O_DIRECT reads
+    slot_bytes_ = options_.chunk_bytes + 2 * kDirectAlign;
+    cuda_throw(cudaHostAlloc(&pinned_, slot_bytes_ * n, cudaHostAllocPortable),
                "DeviceUploader: cudaHostAlloc of the staging buffers");
     slots_.resize(n);
     try {
         for (std::size_t i = 0; i < n; ++i) {
-            slots_[i].host = static_cast<std::byte*>(pinned_) + i * options_.chunk_bytes;
+            slots_[i].host = static_cast<std::byte*>(pinned_) + i * slot_bytes_;
             cuda_throw(cudaEventCreateWithFlags(&slots_[i].done, cudaEventDisableTiming),
                        "DeviceUploader: cudaEventCreateWithFlags");
             free_slots_.push_back(static_cast<int>(i));
@@ -436,6 +442,30 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
                                " differs from the construction device " + std::to_string(device_));
     }
 
+    // cold data (mostly not in the page cache): O_DIRECT, one descriptor per file for this upload
+    bool direct = options_.direct == 1;
+    if (options_.direct < 0) {
+        std::vector<ReadRange> ranges;
+        for (const UploadRequest& r : requests)
+            if (r.bytes) ranges.push_back({r.file, r.offset, r.bytes, nullptr});
+        direct = !ranges.empty() && cached_fraction(ranges) < 0.5;
+        if (const char* v = std::getenv("INGINE_LOAD_DIRECT"); v && *v) direct = *v == '1';
+    }
+    std::map<const SafetensorsFile*, int> direct_fds;
+    struct FdCloser {
+        std::map<const SafetensorsFile*, int>& m;
+        ~FdCloser() {
+            for (auto& [f, fd] : m)
+                if (fd >= 0) ::close(fd);
+        }
+    } closer{direct_fds};
+    auto fd_of = [&](const SafetensorsFile* f) {
+        if (!direct) return -1;
+        auto it = direct_fds.find(f);
+        if (it == direct_fds.end()) it = direct_fds.emplace(f, ::open(f->path().c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC)).first;
+        return it->second;
+    };
+
     std::vector<Chunk> chunks;
     UploadStats stats;
     for (const UploadRequest& r : requests) {
@@ -448,7 +478,7 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
         }
         for (std::uint64_t done = 0; done < r.bytes;) {
             const std::uint64_t n = std::min<std::uint64_t>(r.bytes - done, options_.chunk_bytes);
-            chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done});
+            chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done, fd_of(r.file)});
             done += n;
         }
         stats.bytes += r.bytes;
@@ -523,13 +553,30 @@ void DeviceUploader::run_chunks() {
                 cuda_throw(cudaEventSynchronize(slot.done), "DeviceUploader: staging buffer wait");
                 slot.copy_inflight = false;
             }
+            std::size_t skip = 0;  // where the chunk's bytes start in the staging buffer
             {
                 nvtx::ScopedRange read_range(nvtx::Name::WeightRead, nvtx::Category::Load, chunk.bytes);
-                chunk.file->read_range(chunk.offset, chunk.bytes, slot.host);
+                if (chunk.direct_fd >= 0) {
+                    const std::uint64_t a = chunk.offset & ~std::uint64_t(kDirectAlign - 1);
+                    const std::uint64_t z = (chunk.offset + chunk.bytes + kDirectAlign - 1) & ~std::uint64_t(kDirectAlign - 1);
+                    skip = std::size_t(chunk.offset - a);
+                    std::uint64_t got = 0;
+                    while (got < z - a) {
+                        const ssize_t n = ::pread(chunk.direct_fd, slot.host + got, std::size_t(z - a - got), off_t(a + got));
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n < 0) throw std::runtime_error("O_DIRECT read of " + chunk.file->path().string() + " failed: " +
+                                                            std::strerror(errno));
+                        if (n == 0) break;  // end of file inside the aligned tail
+                        got += std::uint64_t(n);
+                    }
+                    if (got < skip + chunk.bytes) throw std::runtime_error("short read of " + chunk.file->path().string());
+                } else {
+                    chunk.file->read_range(chunk.offset, chunk.bytes, slot.host);
+                }
             }
             {
                 std::lock_guard lock(stream_mutex_);
-                cuda_throw(cudaMemcpyAsync(chunk.dst, slot.host, chunk.bytes, cudaMemcpyHostToDevice,
+                cuda_throw(cudaMemcpyAsync(chunk.dst, slot.host + skip, chunk.bytes, cudaMemcpyHostToDevice,
                                            stream_),
                            "DeviceUploader: cudaMemcpyAsync");
                 slot.copy_inflight = true;

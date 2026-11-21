@@ -1,4 +1,5 @@
 // ingine-serve: the OpenAI-compatible chat completions server (flags and defaults of `python -m ingine.server`).
+#include "core/boot_trace.h"
 #include "engine/fake_generator.h"
 #include "engine/log.h"
 #include "ingine/generator.h"
@@ -6,6 +7,12 @@
 #include "serve/cli.h"
 #include "text/chat.h"
 
+#include <chrono>
+#include <vector>
+#include <atomic>
+#include <cstdlib>
+#include <sys/syscall.h>
+#include <fcntl.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -62,6 +69,8 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 }
 
 }  // namespace
+
+static const auto g_process_start = std::chrono::steady_clock::now();
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
@@ -138,6 +147,8 @@ int main(int argc, char** argv) {
       options.offload_gib = offload_experts;
       options.offload_threads = offload_threads;
       options.offload_adaptive = !offload_static;
+      spdlog::info("boot: process to make_generator {:.3f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start).count());
+      ingine::BootPhase p("make_generator (total)");
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");
@@ -165,6 +176,35 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
     log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
+#ifdef INGINE_WITH_MODEL
+    // Cold starts read the checkpoint with O_DIRECT (fastest from disk, but it leaves the page cache empty):
+    // read it back into the page cache in the background, at idle I/O priority, so the next start of the
+    // server takes the warm path. $INGINE_REWARM=0 skips it.
+    if (const char* v = std::getenv("INGINE_REWARM"); engine && !(v && *v == '0'))
+      std::thread([dir = std::filesystem::path(model_dir)] {
+        // explicit reads: POSIX_FADV_WILLNEED is bounded by the device's readahead window (16 KiB on some
+        // systems) and then reads nothing
+        (void)::syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (3 << 13) /* IOPRIO_CLASS_IDLE */);
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+          if (e.path().extension() != ".safetensors") continue;
+          const int fd = ::open(e.path().c_str(), O_RDONLY | O_CLOEXEC);
+          if (fd < 0) continue;
+          const off_t size = ::lseek(fd, 0, SEEK_END);
+          constexpr off_t kPiece = off_t(16) << 20;
+          std::atomic<off_t> next{0};
+          std::vector<std::thread> readers;
+          for (int k = 0; k < 4; ++k)
+            readers.emplace_back([&] {
+              (void)::syscall(SYS_ioprio_set, 1, 0, (3 << 13));
+              std::vector<char> buf(static_cast<std::size_t>(kPiece));
+              for (off_t o; (o = next.fetch_add(kPiece)) < size;) (void)::pread(fd, buf.data(), std::size_t(kPiece), o);
+            });
+          for (auto& t : readers) t.join();
+          ::close(fd);
+        }
+      }).detach();
+#endif
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

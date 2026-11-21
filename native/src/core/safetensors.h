@@ -149,8 +149,12 @@ struct UploadRequest {
 
 struct UploadOptions {
     std::size_t chunk_bytes = std::size_t(32) << 20; // staging buffer size and max bytes per copy
-    int staging_buffers     = 12;                    // pinned buffers in flight
-    int reader_threads      = 6;                     // threads reading file data into staging
+    int staging_buffers     = 16;                    // pinned buffers in flight
+    int reader_threads      = 12;                    // threads reading file data into staging
+    // O_DIRECT reads (aligned supersets into the staging buffers) when most of an upload's bytes are not in
+    // the page cache: an NVMe drive then delivers its full speed instead of the readahead pace. -1: auto,
+    // 0: never, 1: always ($INGINE_LOAD_DIRECT overrides auto).
+    int direct = -1;
 };
 
 struct UploadStats {
@@ -186,6 +190,7 @@ private:
         std::uint64_t offset;
         std::uint64_t bytes;
         void* dst;
+        int direct_fd; // O_DIRECT descriptor of `file`, or -1
     };
     struct Slot {
         std::byte* host    = nullptr;
@@ -215,6 +220,7 @@ private:
     bool stopping_            = false;
     int active_workers_       = 0;
     std::vector<Chunk> chunks_;
+    std::size_t slot_bytes_ = 0;
     std::size_t next_chunk_ = 0;
     cudaStream_t stream_    = nullptr;
     int device_             = 0; // CUDA device current at construction (owns the events)

@@ -1,10 +1,20 @@
 #include "model/drafter.h"
 
+#include "core/boot_trace.h"
+
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/draft/shortlist.h"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <fstream>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -59,7 +69,10 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
            w.unembed.rows()};
   V_ = w.unembed.rows();
+  BootPhase p_load("  drafter: load()");
   load(model_dir);
+  p_load.done();
+  BootPhase p_rest("  drafter: buffers + tables");
 
   auto bf16s = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
   auto f32s = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
@@ -179,6 +192,40 @@ Drafter::~Drafter() {
   for (auto& [b, g] : advance_graphs_) cudaGraphExecDestroy(g);
 }
 
+// $INGINE_CACHE_DIR, else $XDG_CACHE_HOME/ingine, else ~/.cache/ingine; the fold file is named by a hash of every
+// .safetensors file of the model directory (name, size, mtime), the vocabulary, the rank and the head format.
+// Empty path: caching off ($INGINE_CACHE_DIR set to "-") or no home.
+std::filesystem::path Drafter::fold_cache_path(const std::filesystem::path& model_dir, int V, bool fp8_head) {
+  namespace fs = std::filesystem;
+  fs::path dir;
+  if (const char* c = std::getenv("INGINE_CACHE_DIR"); c && *c) {
+    if (std::string(c) == "-") return {};
+    dir = c;
+  } else if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) {
+    dir = fs::path(x) / "ingine";
+  } else if (const char* h = std::getenv("HOME"); h && *h) {
+    dir = fs::path(h) / ".cache" / "ingine";
+  } else {
+    return {};
+  }
+  std::vector<std::string> parts;
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(model_dir, ec)) {
+    if (e.path().extension() != ".safetensors") continue;
+    const auto size = fs::file_size(e.path(), ec);
+    const auto mtime = fs::last_write_time(e.path(), ec).time_since_epoch().count();
+    parts.push_back(e.path().filename().string() + ":" + std::to_string(size) + ":" + std::to_string(mtime));
+  }
+  std::sort(parts.begin(), parts.end());
+  std::string key = "fold-v1|" + std::to_string(V) + "|" + std::to_string(kd::RANK) + "|" + (fp8_head ? "fp8" : "bf16");
+  for (const auto& p : parts) key += "|" + p;
+  std::uint64_t h = 1469598103934665603ull;  // FNV-1a
+  for (unsigned char c : key) h = (h ^ c) * 1099511628211ull;
+  char name[64];
+  std::snprintf(name, sizeof name, "drafter-fold-%016llx.bin", static_cast<unsigned long long>(h));
+  return dir / name;
+}
+
 void Drafter::load(const std::filesystem::path& model_dir) {
   SafetensorsFile f(model_dir / "mtp.safetensors");
   // Whole data region on the device, then the persistent (aligned, derived) tensors from it.
@@ -188,7 +235,10 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     std::vector<UploadRequest> reqs;
     for (const SafetensorsTensor& t : f.tensors())
       reqs.push_back(upload_request(f, t, static_cast<std::byte*>(raw.p) + (t.offset - base)));
+    BootPhase p0("  drafter: uploader ctor");
     DeviceUploader up(UploadOptions{std::size_t(16) << 20, 4, 4});
+    p0.done();
+    BootPhase p("  drafter: upload mtp");
     up.upload(reqs, stream_);
   }
   auto src = [&](const std::string& name, std::initializer_list<std::int64_t> shape) {
@@ -292,7 +342,40 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   fold_b_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
-  kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+  // The fold is an FP64 product with the whole unembedding (~0.4 s on GPUs with 1/64-rate FP64, at every start)
+  // of fixed inputs: cached on disk, keyed by the checkpoint files and the head's storage format.
+  const std::filesystem::path cache = fold_cache_path(model_dir, V_, head_.scale != nullptr);
+  const std::size_t wbytes = std::size_t(V_) * kd::RANK * 2, bbytes = std::size_t(V_) * 2;
+  bool cached = false;
+  if (!cache.empty()) {
+    std::ifstream in(cache, std::ios::binary);
+    std::vector<char> buf(wbytes + bbytes);
+    if (in && in.read(buf.data(), std::streamsize(buf.size())) && in.peek() == std::ifstream::traits_type::eof()) {
+      CUDA_CHECK(cudaMemcpyAsync(fold_w_, buf.data(), wbytes, cudaMemcpyHostToDevice, stream_));
+      CUDA_CHECK(cudaMemcpyAsync(fold_b_, buf.data() + wbytes, bbytes, cudaMemcpyHostToDevice, stream_));
+      CUDA_CHECK(cudaStreamSynchronize(stream_));  // pageable source
+      cached = true;
+    }
+  }
+  if (!cached) {
+    kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+    if (!cache.empty()) {
+      std::vector<char> buf(wbytes + bbytes);
+      CUDA_CHECK(cudaMemcpyAsync(buf.data(), fold_w_, wbytes, cudaMemcpyDeviceToHost, stream_));
+      CUDA_CHECK(cudaMemcpyAsync(buf.data() + wbytes, fold_b_, bbytes, cudaMemcpyDeviceToHost, stream_));
+      CUDA_CHECK(cudaStreamSynchronize(stream_));
+      std::error_code ec;
+      std::filesystem::create_directories(cache.parent_path(), ec);
+      const std::filesystem::path tmp = cache.string() + ".tmp" + std::to_string(::getpid());
+      {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(buf.data(), std::streamsize(buf.size()));
+        if (!out) ec = std::make_error_code(std::errc::io_error);
+      }
+      if (!ec) std::filesystem::rename(tmp, cache, ec);
+      if (ec) std::filesystem::remove(tmp, ec);  // best effort: no cache next time
+    }
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));  // raw and cat are freed on return
 }
 

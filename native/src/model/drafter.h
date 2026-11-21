@@ -83,6 +83,9 @@ class Drafter {
   // until reset()), so the drafter can propose them. Stream-ordered; call before the drafts that should see them.
   void note_tokens(std::span<const std::int32_t> ids);
 
+  // Where load() caches the Markov head's fold (see drafter.cpp); empty: no cache.
+  static std::filesystem::path fold_cache_path(const std::filesystem::path& model_dir, int V, bool fp8_head);
+
   // A speculative round's transition, entirely from device values (no host synchronisation), for a verify
   // call at the last draft's position `start`: commits the accepted rows (n = *in.accepted + 1 rows of the
   // taps of width *in.m) and drafts for the next anchor at start + n (kernels::draft::set_round).

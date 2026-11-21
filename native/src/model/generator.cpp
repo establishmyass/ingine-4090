@@ -4,6 +4,9 @@
 // options.spec the speculative loop (SpecLoop) drafts with DSpark and verifies with the width-2/4/8 graphs.
 // A prompt that extends the tokens already in the state only prefills the new suffix; any other prompt
 // starts from an empty state.
+#include "core/boot_trace.h"
+
+#include <spdlog/spdlog.h>
 #include "ingine/generator.h"
 
 #include "core/device.h"
@@ -17,6 +20,7 @@
 #include <chrono>
 #include <mutex>
 #include <random>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -59,10 +63,18 @@ class EngineGenerator final : public Generator {
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    BootPhase spec_phase("generator: drafter + spec");
     if (options.spec) {
-      drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
-      drafter_->capture();
+      {
+        BootPhase p("  drafter: load");
+        drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
+      }
+      {
+        BootPhase p("  drafter: capture");
+        drafter_->capture();
+      }
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+      BootPhase p("  spec loop");
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
     }
     // checkpoint layout: target state | drafter context | last prompt logits
@@ -70,6 +82,21 @@ class EngineGenerator final : public Generator {
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+    spec_phase.done();
+    warm_up();
+  }
+
+  // One tiny generation at startup ($INGINE_WARMUP=0 skips it): the first prefill pays one-time setup
+  // (cuBLASLt, first-use allocations, ~60 ms) that would otherwise land on the first request's time to first
+  // token. The state is then forgotten, so no request can reuse the dummy prompt.
+  void warm_up() {
+    if (const char* v = std::getenv("INGINE_WARMUP"); v && *v == '0') return;
+    BootPhase p("generator: warm-up");
+    const std::int32_t prompt[16] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015};
+    Sampling greedy;
+    greedy.temperature = 0.f;
+    generate(prompt, 2, greedy, {}, [](std::span<const std::int32_t>) { return true; });
+    forget_state();
   }
 
  public:
@@ -95,6 +122,10 @@ class EngineGenerator final : public Generator {
     auto t = std::chrono::steady_clock::now();
     try {
       prefill(prompt, stats);
+      if (boot_trace_enabled()) {
+        CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+        spdlog::info("request: prefill of {} tokens {:.1f} ms", n, seconds_since(t) * 1e3);
+      }
       stats.prompt_tokens = n;
       if (spec_) {
         std::int32_t token = sample(static_cast<const float*>(logits_.p), sampling, rng);

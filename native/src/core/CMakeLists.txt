@@ -4,6 +4,7 @@ add_library(ingine_core STATIC
   decode_graph.cpp
   device.cu
   dtype.cpp
+  file_read.cpp
   host_memory.cpp
   safetensors.cpp
   tensor.cpp

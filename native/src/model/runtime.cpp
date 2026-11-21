@@ -1,6 +1,7 @@
 // Model runtime: weights + ablation + state + decoder, decode graphs per call width (engine.Engine._capture),
 // state snapshots and speculative rollback (engine.Engine._snapshot/_restore/_rollback), pipelined width-1
 // steps and the switch graphs of device-selected verify widths.
+#include "core/boot_trace.h"
 #include "model/runtime.h"
 
 #include "core/device.h"
@@ -88,7 +89,10 @@ void GraphExec::launch(cudaStream_t stream) const {
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, offload_options(options));
+  {
+    BootPhase p("load_weights (total)");
+    weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, offload_options(options));
+  }
   ablation_ = load_ablation(options.ablation);
   init();
 }
@@ -102,6 +106,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
+  BootPhase state_phase("runtime: state + buffers");
   state_ = make_state(options.max_ctx, options.kv_fp8);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
@@ -138,6 +143,8 @@ void Runtime::init() {
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
   // write one place)
   for (auto& [m, b] : buffers_) b.token = rm(token_.p, DType::I64, {m});
+  state_phase.done();
+  BootPhase capture_phase("runtime: decode graphs");
   for (const auto& [m, history] : history_) capture(m, history);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }

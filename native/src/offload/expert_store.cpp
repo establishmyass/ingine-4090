@@ -1,6 +1,8 @@
+#include "core/boot_trace.h"
 #include "offload/expert_store.h"
 
 #include "core/device.h"
+#include "core/file_read.h"
 #include "core/safetensors.h"
 #include "offload/cpu_pool.h"
 
@@ -43,47 +45,46 @@ ExpertStore::ExpertStore(const SafetensorsModel& m, const std::vector<LayerExper
   cls_[1].sz = {std::size_t(2) * kI * kH, std::size_t(2) * kI * kH / 32, std::size_t(kH) * kI,
                 std::size_t(kH) * kI / 32};
 
-  // ---- every expert in pinned host memory, in checkpoint layout (four stacked tensors per layer)
-  std::size_t off = 0;
+  // ---- every expert in pinned host memory, in checkpoint layout (four stacked tensors per layer). Each tensor
+  // sits at a 4 KiB phase matching its file offset, so cold loads read it with O_DIRECT (core/file_read.h).
+  std::size_t cursor = 0;
   std::vector<SafetensorsRef> refs;
+  std::vector<std::size_t> dst;
   for (int l = 0; l < kLayers; ++l) {
     cls_of_[l] = layers_[l].fmt == ExpertFmt::NVFP4 ? 0 : 1;
-    layer_off_[l] = off;
     const Sizes& s = cls_[cls_of_[l]].sz;
     const std::size_t per[4] = {s.w13, s.w13s, s.w2, s.w2s};
     for (int t = 0; t < 4; ++t) {
       const SafetensorsRef r = m.at("model.llm.layers." + std::to_string(l) + ".mlp.experts." + kTensor[t]);
       if (r->bytes != per[t] * kExperts)
         throw std::runtime_error("offload: unexpected size of layer " + std::to_string(l) + " " + kTensor[t]);
+      toff_[l][t] = aligned_layout(cursor, r->offset);
+      cursor = toff_[l][t] + r->bytes;
+      total_bytes_ += r->bytes;
       refs.push_back(r);
-      off += r->bytes;
+      dst.push_back(toff_[l][t]);
     }
   }
-  total_bytes_ = off;
-  spdlog::info("offload: reading {:.2f} GiB of experts into host memory", double(off) / double(1ull << 30));
-  host_ = HostRegion(off);
+  spdlog::info("offload: reading {:.2f} GiB of experts into host memory", double(total_bytes_) / double(1ull << 30));
+  BootPhase read_phase("store: read experts");
+  // 4 KiB pages unless INGINE_OFFLOAD_HUGEPAGES=1: huge-page faults stall in compaction (see HostRegion)
+  const char* hp = std::getenv("INGINE_OFFLOAD_HUGEPAGES");
+  host_ = HostRegion(cursor + kDirectAlign, hp != nullptr && *hp == '1');
+  prefault(host_.data(), host_.size(), 16);
   {
-    std::atomic<int> next{0};
-    std::exception_ptr err;
-    std::mutex err_mu;
-    std::vector<std::thread> readers;
-    std::vector<std::size_t> dst(refs.size());
-    for (std::size_t i = 0, o2 = 0; i < refs.size(); ++i) dst[i] = o2, o2 += refs[i]->bytes;
-    for (int k = 0; k < 8; ++k)
-      readers.emplace_back([&] {
-        for (int j; (j = next++) < int(refs.size());) {
-          try {
-            refs[j].file->read_range(refs[j]->offset, refs[j]->bytes, host_.data() + dst[j]);
-          } catch (...) {
-            std::lock_guard<std::mutex> lk(err_mu);
-            err = std::current_exception();
-          }
-        }
-      });
-    for (auto& t : readers) t.join();
-    if (err) std::rethrow_exception(err);
+    std::vector<ReadRange> ranges;
+    for (std::size_t i = 0; i < refs.size(); ++i)
+      ranges.push_back({refs[i].file, refs[i]->offset, refs[i]->bytes, host_.data() + dst[i]});
+    const ReadStats rs = read_ranges(ranges, 16);
+    spdlog::info("offload: read {:.2f} GiB in {:.2f} s ({:.1f} GB/s, {}, {:.0f}% was cached)",
+                 double(rs.bytes) / double(1ull << 30), rs.seconds, double(rs.bytes) / rs.seconds / 1e9,
+                 rs.direct ? "O_DIRECT" : "page cache", 100 * rs.cached);
   }
+  read_phase.done();
+  BootPhase pin_phase("store: cudaHostRegister");
   if (!host_.register_with_cuda()) throw std::runtime_error("offload: cannot pin the expert memory (cudaHostRegister)");
+  pin_phase.done();
+  BootPhase upload_phase("store: placement + upload");
 
   // ---- starting placement: best (count + 1) per byte first, until the VRAM budget is full
   score_.assign(kPairs, 0.0);
@@ -165,6 +166,7 @@ ExpertStore::ExpertStore(const SafetensorsModel& m, const std::vector<LayerExper
   CUDA_CHECK(cudaEventCreateWithFlags(&step_done_, cudaEventDisableTiming));
   CUDA_CHECK(cudaEventCreateWithFlags(&counts_ready_, cudaEventDisableTiming));
   CUDA_CHECK(cudaStreamSynchronize(stream));
+  upload_phase.done();
 
   if (o_.cpu) {
     if (!cpu_experts_supported())
@@ -235,10 +237,8 @@ const std::uint8_t* ExpertStore::host_ptr(int pair, int t) const {
   const int l = pair / kExperts, e = pair % kExperts;
   const Sizes& s = cls_[cls_of_[l]].sz;
   const std::size_t per[4] = {s.w13, s.w13s, s.w2, s.w2s};
-  std::size_t off = layer_off_[l];
-  for (int i = 0; i < t; ++i) off += per[i] * kExperts;
   // UVA: the registered region's device address equals its host address
-  return reinterpret_cast<const std::uint8_t*>(host_.data()) + off + per[t] * e;
+  return reinterpret_cast<const std::uint8_t*>(host_.data()) + toff_[l][t] + per[t] * e;
 }
 
 std::uint8_t* ExpertStore::slot_ptr(int c, int slot, int t) const {

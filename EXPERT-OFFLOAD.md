@@ -70,8 +70,10 @@ shorter chunks read host memory over PCIe. Prefill is bit-identical to the all-i
 | `INGINE_OFFLOAD_SELFTEST=1` | | log the CPU pool's speed at startup |
 | `INGINE_ROUTE_TRACE=FILE` | | record decode routing (`tools/route_offload_study.py`) |
 
-Startup takes ~20 s longer: 14.6 GiB of experts are read into pinned RAM (about 15 GiB of the machine's RAM stays
-pinned while the server runs).
+Startup reads all 14.6 GiB of experts into pinned RAM (about 15 GiB stays pinned while the server runs): ~3.7 s
+from disk (O_DIRECT, 6.5 GB/s), ~1.5 s from the page cache; boot to ready 5.8-6.1 s cold, 3.8 s warm (see
+PORT-3090.md, Startup). Short prompts' first token takes ~240 ms (75 ms without offloading): their prefill reads
+the cold experts they use over PCIe.
 
 ## Caveats
 
