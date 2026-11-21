@@ -73,6 +73,8 @@
 #include "kernels/attn/attn.h"
 
 #include "core/device.h"
+#include "kernels/common/arch.cuh"
+#include "kernels/common/fp8.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -105,7 +107,18 @@ constexpr float INV_3 = 1.f / 3.f;
 // fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
 constexpr size_t WS_PART = 256;
 constexpr int PSTR = D + 4;
-constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_part_bytes(int M) { return size_t(HKV) * CS * GQA * M * PSTR * 4; }
+#ifdef INGINE_AMPERE
+// sm_86 (no clusters): after the partials, what each head's owner writes at the end (new K/V rows bf16
+// [HKV][2][M][D], conv states fp32 [HKV][3][2][D]), staged for attn_finish_kernel.
+constexpr size_t ws_stage_nkv_bytes(int M) { return size_t(HKV) * 2 * M * D * 2; }
+constexpr size_t ws_stage_nst_bytes() { return size_t(HKV) * 3 * 2 * D * 4; }
+constexpr size_t ws_bytes(int M) {
+    return WS_PART + ws_part_bytes(M) + ws_stage_nkv_bytes(M) + ws_stage_nst_bytes();
+}
+#else
+constexpr size_t ws_bytes(int M) { return WS_PART + ws_part_bytes(M); }
+#endif
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
@@ -207,6 +220,8 @@ struct Params {
     float* part;
     __nv_bfloat16* out;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
+    __nv_bfloat16* stage_nkv;  // sm_86 only (ws_bytes): owner data for attn_finish_kernel
+    float* stage_nst;
 };
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -232,7 +247,7 @@ __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
 
 // E4M3 pair (low byte = lower dim) to floats, exact (cvt.f16x2.e4m3x2, then FP16 -> FP32)
 __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
-    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
+    return fp::e4m3x2_to_float2(pair);
 }
 
 // 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
@@ -245,7 +260,7 @@ __device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
 
 // x rounded to E4M3: nearest even, saturated to +-448 (torch: x.clamp(-448, 448).to(float8_e4m3fn))
 __device__ __forceinline__ float e4m3r(float x) {
-    return __half2float(__half(__nv_cvt_fp8_to_halfraw(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
+    return fp::e4m3x2_to_float2(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)).x;
 }
 
 // two floats holding E4M3 values to their bytes (a in the low byte)
@@ -454,7 +469,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
     // a loop ptxas cannot see through: it would sink the loads above below a plain wait
 #pragma unroll 1
-    for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+    for (int i = 0; i <= p.zero; ++i) INGINE_GRIDDEP_WAIT();
     for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
         cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
     for (int i = tid; i < M * GQA * DREL / 4; i += NT)
@@ -487,7 +502,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
     }
     // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    INGINE_GRIDDEP_LAUNCH();
 
     // ---- q and rel post-processing, once per block. q: one warp per row (lane = 4 dims); rel: one
     // half-warp per row. Fixed trip counts and clamped rows (no branches), so the reductions of a warp's
@@ -990,6 +1005,21 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
         }
     }
+#ifdef INGINE_AMPERE
+    // sm_86: no cluster barrier. The 128 blocks cannot all be resident at once (M > 1 needs one SM each),
+    // so the merge and the owner's writes move to attn_finish_kernel, the next kernel in the stream: the
+    // partials are in the workspace; the owner stages its new K/V rows and conv states next to them.
+    if (owner) {
+        __syncthreads();
+        const uint4* nkv = reinterpret_cast<const uint4*>(&s_nkv[0][0][0]);
+        uint4* dn = reinterpret_cast<uint4*>(p.stage_nkv + size_t(g) * 2 * M * D);
+        for (int idx = tid; idx < 2 * M * D / 8; idx += NT) __stcg(dn + idx, nkv[idx]);
+        for (int idx = tid; idx < 3 * 2 * D; idx += NT) __stcg(p.stage_nst + size_t(g) * 3 * 2 * D + idx, sm[L::NST + idx]);
+    }
+    (void)kc;
+    (void)vc;
+}
+#else
     // every partial of the head is written, and every block of the head is done reading the ring
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
 
@@ -1051,6 +1081,84 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
 }
+#endif
+
+#ifdef INGINE_AMPERE
+// sm_86 second half of attn_decode_kernel (from its cluster barrier on): the same merge of the 16 partials,
+// sink, gate and owner writes, with the values the main kernel kept in shared memory read from where they
+// came from (sink and gate rows of `proj`) or from the workspace stage (new K/V rows, conv states). Same
+// grid, same thread mapping, same arithmetic: the output is identical.
+template <int M, bool FULL, bool F8>
+__global__ void __launch_bounds__(NT) attn_finish_kernel(const Params p) {
+    using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;
+    constexpr int ROWS = GQA * M;
+    const int g = blockIdx.y, rank = blockIdx.x, tid = threadIdx.x;
+    const bool owner = rank == 0;
+    const int R = p.R;
+    CT* const kc = static_cast<CT*>(p.k_cache);
+    CT* const vc = static_cast<CT*>(p.v_cache);
+    const int p0 = int(ld_s64(p.pos));
+    if (FULL && p0 + M > p.cap) return;  // the main kernel returned too
+
+    if (tid < ROWS * OD) {
+        const int row = tid / OD, dim = rank * OD + tid % OD;
+        const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
+        float2 ml[CS];
+        float o[CS];
+#pragma unroll
+        for (int q = 0; q < CS; ++q) {
+            ml[q] = __ldcg(reinterpret_cast<const float2*>(src + q * ROWS * PSTR + D));
+            o[q] = __ldcg(src + q * ROWS * PSTR + dim);
+        }
+        const float* prow = p.proj + size_t(row / GQA) * R;
+        const float sink = __ldcg(prow + OFF_SINK + g * GQA + row % GQA) * LOG2E;
+        float mx = sink;
+#pragma unroll
+        for (int q = 0; q < CS; ++q) mx = fmaxf(mx, ml[q].x);
+        float l = exp2f(sink - mx), a = 0.f;
+#pragma unroll
+        for (int q = 0; q < CS; ++q) {
+            const float f = exp2f(ml[q].x - mx);
+            l += ml[q].y * f;
+            a += o[q] * f;
+        }
+        const float gate = 1.f / (1.f + expf(-__ldcg(prow + OFF_GATE + (g * GQA + row % GQA) * D + dim)));
+        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+    }
+
+    if (owner) {
+        const uint4* nkv = reinterpret_cast<const uint4*>(p.stage_nkv + size_t(g) * 2 * M * D);  // [2][M][D]
+        for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
+            const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+            const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+            const uint4 u = __ldcg(nkv + (kv * M + m) * 16 + c8);
+            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+            if constexpr (F8) {  // exact: the values are E4M3 already
+                float f[8];
+                unpack8(u, f);
+                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+            } else {
+                reinterpret_cast<uint4*>(dst)[c8] = u;
+            }
+        }
+        const float* nst = p.stage_nst + size_t(g) * 3 * 2 * D;
+        for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
+            const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
+            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = __ldcg(nst + idx);
+        }
+        if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
+    }
+    if (!FULL && M > 1 && owner && tid == 0) {  // kpos is read by every head: the last head writes it
+        __threadfence();
+        if (atomicAdd(p.counter, 1) == HKV - 1) {
+            __threadfence();
+            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+            *p.counter = 0;
+        }
+    }
+}
+#endif
 
 void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("attn: ") + what);
@@ -1062,15 +1170,21 @@ struct Kernel {
     KernelFn fn;
     int M;
     size_t smem;
+    KernelFn finish;  // sm_86: attn_finish_kernel, launched right after fn; null otherwise
 };
 
 template <int M, bool FULL, bool F8>
 Kernel kernel_of() {
     static const Kernel k = [] {
         const KernelFn f = attn_decode_kernel<M, FULL, F8>;
+#ifdef INGINE_AMPERE
+        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M>::BYTES)));
+        return Kernel{f, M, Smem<M>::BYTES, attn_finish_kernel<M, FULL, F8>};
+#else
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M>::BYTES)));
-        return Kernel{f, M, Smem<M>::BYTES};
+        return Kernel{f, M, Smem<M>::BYTES, nullptr};
+#endif
     }();
     return k;
 }
@@ -1102,7 +1216,11 @@ cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunc
     attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attrs;
+#ifdef INGINE_AMPERE
+    cfg.numAttrs = 0;  // a plain 16 x 8 grid
+#else
     cfg.numAttrs = 2;
+#endif
     return cfg;
 }
 
@@ -1117,12 +1235,21 @@ int max_active_clusters(int M, int window) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     // the FP8 variants have the same launch shape, shared memory and register cap (launch bounds)
     const Kernel k = window == 0 ? select<true>(M) : select<false>(M);
+#ifdef INGINE_AMPERE
+    // no clusters: how many 16-block groups (one KV head each) fit on the GPU at once
+    int dev = 0, sms = 0, per_sm = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.fn, NT, k.smem));
+    return sms * per_sm / CS;
+#else
     cudaLaunchAttribute attrs[2];
     cudaLaunchConfig_t cfg = launch_config(k, nullptr, attrs);
     cfg.numAttrs = 1;  // occupancy: the cluster shape only
     int n = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
     return n;
+#endif
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
@@ -1161,10 +1288,19 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
+#ifdef INGINE_AMPERE
+    char* const stage = static_cast<char*>(a.workspace) + WS_PART + ws_part_bytes(M);
+    p.stage_nkv = reinterpret_cast<__nv_bfloat16*>(stage);
+    p.stage_nst = reinterpret_cast<float*>(stage + ws_stage_nkv_bytes(M));
+#endif
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
+#ifdef INGINE_AMPERE
+    k.finish<<<dim3(CS, HKV), NT, 0, stream>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 }  // namespace ingine::kernels::attn

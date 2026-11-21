@@ -610,6 +610,21 @@ uint64_t lock_router(LockGen& g, int M) {
 }
 
 // [M - 1][mix, message_gates, router]
+#ifdef INGINE_AMPERE
+// RTX 3090 (sm_86) build, recorded on an RTX 3090. Rows 2, 3, 4 and 6 and every router hash equal the RTX
+// 5090 ones; mix (M = 5, 7, 8) and message_gates (M = 1) differ in the last bits of some outputs under
+// sm_86 code generation, within the reference tolerances checked above.
+constexpr uint64_t kLock[8][3] = {
+    {0x2b27dd32a1dd100eull, 0x5cf894dc6987c9aaull, 0x51c35a315b7e90b3ull},
+    {0x75334db64229e2e1ull, 0x1940463968d37814ull, 0xea1ef0b8721fb3ffull},
+    {0xbcbd0a5db598e31eull, 0xc5d6d6cbeced9705ull, 0x92540ffd2106daacull},
+    {0xa6717a49034460f7ull, 0xc2cec0ccbcefa691ull, 0x70dd87ceaf1a3d15ull},
+    {0xae916c02bedf9161ull, 0xfa3a8c6799d1da0aull, 0xe7e125992e15339eull},
+    {0xbe73b36287e82a47ull, 0x61ac1608d61c8021ull, 0xc8df312f5d2c4bc3ull},
+    {0xcebc78ab047096f8ull, 0x908da1a2466cd8ebull, 0x76e91bc67374d743ull},
+    {0x96f825e6ff08e70dull, 0xd6dded13cf36fa5cull, 0xffe0d044657686f0ull},
+};
+#else
 constexpr uint64_t kLock[8][3] = {
     {0x2b27dd32a1dd100eull, 0x5efdd3c8b07ce184ull, 0x51c35a315b7e90b3ull},
     {0x75334db64229e2e1ull, 0x1940463968d37814ull, 0xea1ef0b8721fb3ffull},
@@ -620,6 +635,7 @@ constexpr uint64_t kLock[8][3] = {
     {0x82fcad4fa28a5d54ull, 0x908da1a2466cd8ebull, 0x76e91bc67374d743ull},
     {0x485152f0b0ead6f4ull, 0xd6dded13cf36fa5cull, 0xffe0d044657686f0ull},
 };
+#endif
 
 bool test_bit_lock() {
   bool ok = true;

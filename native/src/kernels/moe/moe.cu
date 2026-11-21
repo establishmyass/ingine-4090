@@ -43,6 +43,8 @@
 // Ported from engine/csrc/moe/moe.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/moe/moe.h"
 
+#include "kernels/common/arch.cuh"
+#include "kernels/common/fp8.cuh"
 #include "kernels/common/l2.cuh"
 
 #include "core/device.h"
@@ -159,24 +161,9 @@ __device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uin
 
 // ------------------------------------------------------------------------------------------ decode
 
-__device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) {
-    uint32_t r;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
-    return r;
-}
+__device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) { return fp::e4m3x2_to_f16x2(v); }
 
-__device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) {
-    asm("{\n"
-        ".reg .b8 b0, b1, b2, b3;\n"
-        "mov.b32 {b0, b1, b2, b3}, %4;\n"
-        "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
-        "cvt.rn.f16x2.e2m1x2 %1, b1;\n"
-        "cvt.rn.f16x2.e2m1x2 %2, b2;\n"
-        "cvt.rn.f16x2.e2m1x2 %3, b3;\n"
-        "}"
-        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
-        : "r"(w));
-}
+__device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) { fp::e2m1x8_to_f16x2x4(w, h); }
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
@@ -266,8 +253,8 @@ __device__ __forceinline__ void load_x(Frag<FMT>& f, const __nv_bfloat16* xrow, 
 }
 
 // Programmatic dependent launch (no-ops when the kernel is launched without the PDL attribute).
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() { INGINE_GRIDDEP_WAIT(); }
+__device__ __forceinline__ void pdl_trigger() { INGINE_GRIDDEP_LAUNCH(); }
 
 template <int FMT>
 __device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4]) {
@@ -499,7 +486,7 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
-    cfg.numAttrs = pdl ? 1 : 0;
+    cfg.numAttrs = pdl && kHasPdl ? 1 : 0;
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<Params>(args)...));
 }
 

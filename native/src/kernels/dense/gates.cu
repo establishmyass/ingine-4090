@@ -28,6 +28,7 @@
 // all tokens in one reduction, single-barrier block sums, mbarrier exchanges) and the prefetch.
 #include <cooperative_groups.h>
 
+#include "kernels/common/group_sync.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
@@ -43,6 +44,15 @@ namespace ingine::kernels::dense {
 namespace {
 
 constexpr int RANK = 64;
+
+#ifdef INGINE_AMPERE
+// sm_86: each gate's CL CTAs are part of an ordinary grid; the two exchanges (down outputs, sums of squares)
+// go through L2 and a software barrier per gate (group_sync.cuh) instead of st.async + mbarriers. Every
+// CTA reads the same values and sums them in the same order as on the RTX 5090.
+__device__ float g_gates_down[3][8][RANK];  // [gate][token][row]: BF16-rounded down outputs
+__device__ float g_gates_ss[3][16][8];      // [gate][CTA][token]: sums of squares of the CTA's channels
+__device__ GroupBarrier g_gates_bar[3];
+#endif
 // L2 class of the weight loads (l2.cuh): none. Evict::last does keep the gate weights (56 MB over the loop
 // layers) and the router matrices in the L2 through a token's weight streams, but the decode step was ~2%
 // slower with it: their fetch already overlaps the previous kernel, and the L2 (~96 MB) then has ~25 MB
@@ -91,15 +101,21 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __shared__ __align__(16) float part[M][2][C::RPC];  // per-half partial dots
   __shared__ __align__(16) float ssall[CL][4 * MQ];   // per-CTA sums of squares of the gated output, received
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
-  __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
 
+#ifdef INGINE_AMPERE
+  static_assert(CL == 16 && M <= 8, "global exchange buffers");
+  const int rank = blockIdx.x % CL;
+#else
+  __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
+#endif
   const int g = blockIdx.x / CL;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int rl = warp >> 1, half = warp & 1;  // down projection: warp = (row_local, half)
   const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
   const float* mg = a.msg + size_t(g) * M * H;
+#ifndef INGINE_AMPERE
   const uint32_t mb_g = smem_u32(&mbar[0]), mb_s = smem_u32(&mbar[1]);
   if (t == 0) {
     mb_init(mb_g);
@@ -109,6 +125,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     mb_expect(mb_s, 16u * CL * MQ);
   }
   cluster_arrive_relaxed();  // waited for before the first remote store
+#endif
 
   // inputs: XPT of h and of msg per thread, coalesced (activations: loaded after the PDL wait)
   float xh[XPT], xm[XPT];
@@ -191,6 +208,16 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
   __syncthreads();
 
+#ifdef INGINE_AMPERE
+  if (t < M) {  // the token's 4 rows as one 16-byte store, read by every CTA of the gate after the barrier
+    const int m = t;
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[m][0][0]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[m][1][0]);
+    const float4 v = make_float4(round_bf16(p0.x + p1.x), round_bf16(p0.y + p1.y), round_bf16(p0.z + p1.z),
+                                 round_bf16(p0.w + p1.w));
+    __stcg(reinterpret_cast<float4*>(&g_gates_down[g][m][rank * C::RPC]), v);
+  }
+#else
   cluster_wait();  // all CTAs resident, barriers initialised: remote stores may start
   if (t < M * CL) {  // thread (token m, destination d): the token's 4 rows as one 16-byte store
     const int m = t % M, d = t / M;
@@ -200,6 +227,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
                                  round_bf16(p0.w + p1.w));
     st_async4(remote(smem_u32(&gall[m][rank * C::RPC]), d), v, remote(mb_g, d));
   }
+#endif
   // this thread's channel inputs fly during the exchange
   const int c = rank * C::CPC + t;
   const bool own = t < C::CPC;
@@ -216,7 +244,14 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
   asm volatile("cp.async.wait_all;" ::: "memory");
   __syncthreads();  // forget/gain slices from all threads' copies are visible
+#ifdef INGINE_AMPERE
+  group_sync(&g_gates_bar[g], CL);  // every CTA of the gate stored its down rows
+  for (int i = t; i < M * RANK / 4; i += C::NT)
+    reinterpret_cast<float4*>(&gall[0][0])[i] = __ldcg(reinterpret_cast<const float4*>(&g_gates_down[g][0][0]) + i);
+  __syncthreads();
+#else
   mb_wait(mb_g);
+#endif
 
   // forget / gain: one thread per channel; its two weight rows are read as 16-byte chunks from the padded
   // slices (8 consecutive threads hit 8 distinct bank groups), g is a broadcast read
@@ -262,6 +297,15 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
 
   // per-token sums of squares of this CTA's channels, sent to every CTA
   block_sum_bcast<M, C::NW>(sq, red);
+#ifdef INGINE_AMPERE
+  if (t == 0) {
+#pragma unroll
+    for (int m = 0; m < M; ++m) __stcg(&g_gates_ss[g][rank][m], sq[m]);
+  }
+  group_sync(&g_gates_bar[g], CL);  // every CTA of the gate stored its sums
+  for (int i = t; i < CL * M; i += C::NT) ssall[i / M][i % M] = __ldcg(&g_gates_ss[g][i / M][i % M]);
+  __syncthreads();
+#else
   if (t < CL) {  // to CTA t: the M sums as 16-byte stores
     float r[4 * MQ] = {};
 #pragma unroll
@@ -272,6 +316,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
                 remote(mb_s, t));
   }
   mb_wait(mb_s);
+#endif
 
   if (own) {
 #pragma unroll
@@ -289,7 +334,12 @@ void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream
   using C = GateCfg<CL, FG32>;
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    launch_ex(gates_kernel<CL, FG32, MM>, dim3(G * CL), C::NT, C::SMEM, CL, pdl, stream, a);
+#ifdef INGINE_AMPERE
+    constexpr int launch_cl = 1;  // a plain grid of G groups of CL CTAs (group_sync.cuh)
+#else
+    constexpr int launch_cl = CL;
+#endif
+    launch_ex(gates_kernel<CL, FG32, MM>, dim3(G * CL), C::NT, C::SMEM, launch_cl, pdl, stream, a);
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;

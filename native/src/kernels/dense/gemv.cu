@@ -45,6 +45,7 @@
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/common/l2.cuh"
+#include "kernels/common/fp8.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
 #include "kernels/dense/dense.h"
@@ -214,8 +215,7 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 
 // 2 E4M3 (low 16 bits of u) -> BF16x2, exact (via FP16 and FP32)
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+  const float2 f = fp::e4m3x2_to_float2(u & 0xffffu);
   const __nv_bfloat162 b = __float22bfloat162_rn(f);
   return *reinterpret_cast<const uint32_t*>(&b);
 }

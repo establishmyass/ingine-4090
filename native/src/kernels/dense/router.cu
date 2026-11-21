@@ -21,6 +21,7 @@
 // Ported from engine/csrc/dense/router.cu (torch launchers -> raw pointers; mbarrier exchange).
 #include <cooperative_groups.h>
 
+#include "kernels/common/group_sync.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
@@ -38,6 +39,13 @@ constexpr int EXPERTS = 128, TOPK = 8;
 // L2 class of the weight loads (l2.cuh): none (see gates.cu: evict-last residency made the step slower)
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 
+#ifdef INGINE_AMPERE
+// sm_86: the CL CTAs are an ordinary grid; logits go through L2 instead of st.async into CTA m's shared
+// memory, and a software barrier replaces the mbarrier (group_sync.cuh). Same values, same order.
+__device__ float g_router_logits[8][EXPERTS];
+__device__ GroupBarrier g_router_bar;
+#endif
+
 template <int CL, bool WF32, int M>
 __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bfloat16* __restrict__ x,
                                                                    const void* __restrict__ w,
@@ -49,13 +57,16 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   constexpr int CH = H / (EPC * 32);
   __shared__ __align__(16) __nv_bfloat16 xs[M][H];
   __shared__ __align__(16) float logits[EXPERTS];  // token `rank`'s logits (CTAs rank < M)
-  __shared__ __align__(8) uint64_t mbar;           // completes when the 128 logits arrived
   __shared__ __align__(16) float part[M][RPC];     // this CTA's logits
   __shared__ unsigned long long keys[EXPERTS];    // selection keys of sigmoid + bias
   __shared__ int cnt[NT];                          // partial ranks
   __shared__ float sel_s[TOPK];
   __shared__ int sel_e[TOPK];
 
+#ifdef INGINE_AMPERE
+  const int rank = blockIdx.x;  // grid = one group of CL CTAs
+#else
+  __shared__ __align__(8) uint64_t mbar;           // completes when the 128 logits arrived
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
   const uint32_t logits_u = smem_u32(logits), mb = smem_u32(&mbar);
@@ -65,6 +76,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
     if (rank < M) mb_expect(mb, 4u * EXPERTS);
   }
   cluster_arrive_relaxed();
+#endif
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int row = rank * RPC + warp;
 
@@ -115,6 +127,17 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   // gather the CTA's RPC logits of each token, then one 16-byte store per (token, 4 rows)
   if (lane < M) part[lane][warp] = logit;
   __syncthreads();
+#ifdef INGINE_AMPERE
+  if (t < M * (RPC / 4)) {
+    const int tok = t % M, grp = t / M;
+    __stcg(reinterpret_cast<float4*>(&g_router_logits[tok][rank * RPC + grp * 4]),
+           *reinterpret_cast<const float4*>(&part[tok][grp * 4]));
+  }
+  group_sync(&g_router_bar, CL, rank < M);  // CTAs that own no token arrive and exit
+  if (rank >= M) return;
+  if (t < EXPERTS) logits[t] = __ldcg(&g_router_logits[rank][t]);
+  __syncthreads();
+#else
   cluster_wait();  // every CTA has started and initialised its barrier
   if (t < M * (RPC / 4)) {
     const int tok = t % M, grp = t / M;
@@ -123,6 +146,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   }
   if (rank >= M) return;
   mb_wait(mb);
+#endif
 
   // selection: unique 39-bit keys (order-preserving bits of v, then 127 - e: ties go to the lower expert),
   // rank = number of greater keys, counted by all NT threads (NT / 128 parts of the key range)
@@ -172,8 +196,13 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
                    cudaStream_t stream) {
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    launch_ex(router_kernel<CL, WF32, MM>, dim3(CL), 32 * EXPERTS / CL, 0, CL, pdl, stream, x, w, bias, idx, wts,
-              0u);
+#ifdef INGINE_AMPERE
+    constexpr int launch_cl = 1;  // a plain grid of CL CTAs (group_sync.cuh)
+#else
+    constexpr int launch_cl = CL;
+#endif
+    launch_ex(router_kernel<CL, WF32, MM>, dim3(CL), 32 * EXPERTS / CL, 0, launch_cl, pdl, stream, x, w, bias, idx,
+              wts, 0u);
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;
@@ -190,6 +219,9 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
 
 // 16-CTA clusters need the non-portable opt-in and a GPC with 16 free SMs; fall back to 8 otherwise.
 int router_cluster_size() {
+#ifdef INGINE_AMPERE
+  return 16;  // 16 CTAs, no cluster: always schedulable
+#endif
   static const int cl = [] {
     auto k = router_kernel<16, true, 8>;
     if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess) {

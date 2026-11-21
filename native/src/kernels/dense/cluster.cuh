@@ -3,6 +3,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "kernels/common/arch.cuh"
 
 #include <cuda_runtime.h>
 
@@ -30,8 +31,8 @@ __device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.w
 // completed and its writes are visible. pdl_trigger() lets the next kernel of the stream start its own
 // prologue (it still waits for this grid's completion before reading our outputs). Both are no-ops when
 // the kernel was not launched with the PDL attribute.
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() { INGINE_GRIDDEP_WAIT(); }
+__device__ __forceinline__ void pdl_trigger() { INGINE_GRIDDEP_LAUNCH(); }
 // griddepcontrol.wait that keeps the loads issued before it ahead of it. ptxas sinks independent loads
 // below a plain griddepcontrol.wait (legal: the wait only orders later accesses), even below a
 // __syncthreads, which silently turns the "weights in flight before the wait" prefetch into loads issued
@@ -39,7 +40,7 @@ __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.lau
 // `zero` must be 0 at run time and opaque to the compiler (a kernel argument).
 __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
 #pragma unroll 1
-  for (uint32_t i = 0; i <= zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+  for (uint32_t i = 0; i <= zero; ++i) INGINE_GRIDDEP_WAIT();
 }
 
 // Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1, with
@@ -48,6 +49,10 @@ __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
 template <class... KArgs, class... Args>
 void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl, bool pdl, cudaStream_t stream,
                Args&&... args) {
+#ifdef INGINE_AMPERE
+  require(cl == 1, "launch_ex: sm_86 has no thread-block clusters");
+  pdl = false;
+#endif
   if (cl > 8) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
   // static + dynamic shared memory above 48 KB needs the opt-in, whatever the split
   if (smem > 0) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));

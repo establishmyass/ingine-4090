@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include "kernels/common/arch.cuh"
+
 #include <cstddef>
 #include <utility>
 
@@ -32,16 +34,16 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     config.dynamicSmemBytes = launch.dynamic_smem_bytes;
     config.stream           = launch.stream;
     config.attrs            = &attribute;
-    config.numAttrs         = 1;
+    config.numAttrs         = ::ingine::kernels::kHasPdl ? 1 : 0;
 
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
 }
 
 // Every producer CTA must call this at least once or exit. This enables dependent scheduling but
 // does not make producer writes visible to the consumer.
-__device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLaunchCompletion(); }
+__device__ __forceinline__ void trigger_dependents() { INGINE_GRIDDEP_LAUNCH(); }
 
 // Call on every consumer control path before its first access to producer-dependent data.
-__device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
+__device__ __forceinline__ void wait_for_dependencies() { INGINE_GRIDDEP_WAIT(); }
 
 } // namespace ingine::pdl

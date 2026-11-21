@@ -5,6 +5,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+#include "kernels/common/fp8.cuh"
 #include <stdint.h>
 
 namespace ingine::kernels::dense {
@@ -44,10 +46,8 @@ __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float* f) {
 
 // 4 E4M3 values (one uint32, element 0 in the low byte) -> 4 floats (exact via FP16).
 __device__ __forceinline__ void unpack_e4m3x4(uint32_t u, float* f) {
-  __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u >> 16), __NV_E4M3);
-  float2 a = __half22float2(*reinterpret_cast<__half2*>(&lo));
-  float2 b = __half22float2(*reinterpret_cast<__half2*>(&hi));
+  const float2 a = ::ingine::kernels::fp::e4m3x2_to_float2(u & 0xffffu);
+  const float2 b = ::ingine::kernels::fp::e4m3x2_to_float2(u >> 16);
   f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
 }
 

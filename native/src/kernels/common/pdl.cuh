@@ -32,13 +32,15 @@
 // captured decode.
 #include <cuda_runtime.h>
 
+#include "kernels/common/arch.cuh"
+
 #include <utility>
 
 namespace ingine::kernels {
 
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void pdl_trigger() { INGINE_GRIDDEP_LAUNCH(); }
 
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() { INGINE_GRIDDEP_WAIT(); }
 
 // `pointer` without its kernel-parameter provenance (see above): loads through it are coherent.
 template <class T>
@@ -68,7 +70,7 @@ cudaError_t pdl_launch(void (*kernel)(Params...), dim3 grid, dim3 block, std::si
     attr[0].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs                                          = attr;
-    cfg.numAttrs                                       = 1;
+    cfg.numAttrs                                       = kHasPdl ? 1 : 0;
     return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
 }
 

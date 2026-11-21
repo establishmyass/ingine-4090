@@ -6,9 +6,9 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|86)$")
   message(FATAL_ERROR
-    "ingine supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "ingine supports only CMAKE_CUDA_ARCHITECTURES=120a (RTX 5090) or 86 (RTX 3090 port); got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
@@ -44,6 +44,12 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
 endif()
 
 include(cmake/Dependencies.cmake)
+
+# RTX 3090 port: sm_86 has no programmatic dependent launch, thread-block clusters / distributed shared
+# memory or hardware FP8 / FP4 conversions; INGINE_AMPERE selects the replacements (host and device code).
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
+  add_compile_definitions(INGINE_AMPERE=1)
+endif()
 
 add_subdirectory(third_party)
 add_subdirectory(src/core)
