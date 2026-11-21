@@ -2,8 +2,9 @@
 // the Prefiller; plain decoding replays the width-1 graph per token, pipelined (each step's input token
 // stays on the device, the host launches the next step before it reads the current token); with
 // options.spec the speculative loop (SpecLoop) drafts with DSpark and verifies with the width-2/4/8 graphs.
-// A prompt that extends the tokens already in the state only prefills the new suffix; any other prompt
-// starts from an empty state.
+// A prompt that extends the tokens already in the state only prefills the new suffix; otherwise the longest
+// prompt checkpoint that is a prefix of it is restored (the last prompt's in VRAM, a few earlier ones in pinned
+// host memory), else it starts from an empty state.
 #include "core/boot_trace.h"
 
 #include <spdlog/spdlog.h>
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <cstdlib>
@@ -43,6 +45,17 @@ struct ImageKey {
   int pos = 0, tokens = 0;
   std::uint64_t hash = 0;
   bool operator==(const ImageKey&) const = default;
+};
+
+// An earlier prompt's checkpoint in pinned host memory (EngineGenerator::checkpoint_'s layout) and what it
+// holds: the prompt, its images, the drafter's length and context tokens. Empty ids: unused or stale.
+struct OlderCheckpoint {
+  std::unique_ptr<PinnedHostBuffer> buf;
+  std::vector<std::int32_t> ids;
+  std::vector<ImageKey> images;
+  int drafter_length = 0;
+  std::vector<std::int32_t> drafter_extra;
+  std::uint64_t seq = 0;
 };
 
 class EngineGenerator final : public Generator {
@@ -88,6 +101,17 @@ class EngineGenerator final : public Generator {
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
+    // older prompt checkpoints in pinned host memory ($INGINE_PROMPT_CHECKPOINTS counts the VRAM one too)
+    int keep = 4;
+    if (const char* v = std::getenv("INGINE_PROMPT_CHECKPOINTS"); v && *v) keep = std::max(1, std::atoi(v));
+    older_.resize(std::size_t(keep - 1));
+    spdlog::info("prompt checkpoints: 1 in VRAM + {} in host memory (allocated when first used), {:.0f} MiB each",
+                 older_.size(), double(checkpoint_.bytes) / (1 << 20));
+    if (!older_.empty()) {
+      CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+      CUDA_CHECK(cudaEventCreateWithFlags(&ev_ready_, cudaEventDisableTiming));
+      CUDA_CHECK(cudaEventCreateWithFlags(&ev_moved_, cudaEventDisableTiming));
+    }
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
     spec_phase.done();
     warm_up();
@@ -167,6 +191,12 @@ class EngineGenerator final : public Generator {
   ~EngineGenerator() override {
     // nothing queued may outlive the graphs and buffers of the members destroyed below
     if (rt_.stream()) cudaStreamSynchronize(rt_.stream());
+    if (copy_stream_) {
+      cudaStreamSynchronize(copy_stream_);
+      cudaStreamDestroy(copy_stream_);
+      cudaEventDestroy(ev_ready_);
+      cudaEventDestroy(ev_moved_);
+    }
   }
 
  private:
@@ -179,6 +209,9 @@ class EngineGenerator final : public Generator {
     checkpoint_ids_.clear();
     state_images_.clear();
     checkpoint_images_.clear();
+    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
+    move_pending_ = false;
+    for (OlderCheckpoint& o : older_) o.ids.clear();
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
@@ -255,19 +288,37 @@ class EngineGenerator final : public Generator {
         same_images(state_images_, images, prev.size())) {
       start = prev.size();
       stats.reuse = Reuse::Extend;
-    } else if (!checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
-               std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin()) &&
-               same_images(checkpoint_images_, images, checkpoint_ids_.size())) {
-      restore_checkpoint();
-      start = checkpoint_ids_.size();
-      stats.reuse = Reuse::Checkpoint;
     } else {
-      reset_state(st, stream);
-      if (drafter_) drafter_->reset();
-      tokens_in_state_.clear();
-      state_images_.clear();
-      stats.reuse = Reuse::None;
+      // the longest checkpoint that is a prefix of `ids` with the same images: the VRAM one (-1) or an older one
+      auto fits = [&](const std::vector<std::int32_t>& c, const std::vector<ImageKey>& im) {
+        return !c.empty() && c.size() <= n && std::equal(c.begin(), c.end(), ids.begin()) && same_images(im, images, c.size());
+      };
+      int best = -2;
+      std::size_t best_len = 0;
+      if (fits(checkpoint_ids_, checkpoint_images_)) best = -1, best_len = checkpoint_ids_.size();
+      for (std::size_t i = 0; i < older_.size(); ++i)
+        if (older_[i].ids.size() > best_len && fits(older_[i].ids, older_[i].images)) best = int(i), best_len = older_[i].ids.size();
+      if (best == -1) {
+        restore_checkpoint();
+        stats.reuse = Reuse::Checkpoint;
+      } else if (best >= 0) {
+        restore_older(older_[std::size_t(best)]);
+        stats.reuse = Reuse::OlderCheckpoint;
+      } else {
+        reset_state(st, stream);
+        if (drafter_) drafter_->reset();
+        tokens_in_state_.clear();
+        state_images_.clear();
+        stats.reuse = Reuse::None;
+      }
+      start = best >= -1 ? best_len : 0;
     }
+    // positions from `start` on are rewritten: checkpoints longer than that no longer match the state
+    if (checkpoint_ids_.size() > start) checkpoint_ids_.clear(), checkpoint_images_.clear();
+    for (OlderCheckpoint& o : older_)
+      if (o.ids.size() > start) o.ids.clear();
+    // the VRAM checkpoint is replaced at the end of this prefill: copy it to host memory meanwhile
+    if (start < n && !checkpoint_ids_.empty() && !older_.empty()) move_checkpoint_to_host();
     st.length = int(start);  // decode steps advance the state without its host-side length
     const std::size_t chunk = std::size_t(options_.prefill_chunk);
     for (std::size_t s = start; s < n; s += chunk) {
@@ -294,6 +345,10 @@ class EngineGenerator final : public Generator {
   // The checkpoint (on the device): target state (Runtime::save_checkpoint) | drafter context
   // (Drafter::save_checkpoint) | logits of the last prompt token.
   void save_checkpoint() {
+    if (move_pending_) {  // the VRAM checkpoint is still being copied to host memory
+      CUDA_CHECK(cudaStreamWaitEvent(rt_.stream(), ev_moved_, 0));
+      move_pending_ = false;
+    }
     char* p = static_cast<char*>(checkpoint_.p);
     rt_.save_checkpoint(p);
     if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
@@ -311,6 +366,55 @@ class EngineGenerator final : public Generator {
                                rt_.stream()));
     tokens_in_state_ = checkpoint_ids_;
     state_images_ = checkpoint_images_;
+  }
+
+  // An older checkpoint (host memory, same layout) back into the state. Stream-ordered after the copy that
+  // filled it (save_checkpoint waited for it).
+  void restore_older(const OlderCheckpoint& o) {
+    const char* p = static_cast<const char*>(o.buf->data());
+    rt_.restore_checkpoint(p);
+    if (drafter_) drafter_->restore_copy(p + checkpoint_drafter_, o.drafter_length, o.drafter_extra);
+    CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyHostToDevice, rt_.stream()));
+    tokens_in_state_ = o.ids;
+    state_images_ = o.images;
+  }
+
+  // Copies the VRAM checkpoint into a host slot on the copy stream, overlapping the prefill that follows;
+  // save_checkpoint waits for it before overwriting. The slot: an unused one, else the oldest other than the one
+  // just restored.
+  void move_checkpoint_to_host() {
+    std::size_t slot = 0;
+    bool found = false;
+    for (std::size_t i = 0; i < older_.size() && !found; ++i)
+      if (older_[i].ids.empty()) slot = i, found = true;
+    if (!found) {
+      std::size_t keep = older_.size();  // the restored one, if any
+      for (std::size_t i = 0; i < older_.size(); ++i)
+        if (older_[i].ids.size() == tokens_in_state_.size() && older_[i].ids == tokens_in_state_) keep = i;
+      std::uint64_t oldest = ~std::uint64_t(0);
+      for (std::size_t i = 0; i < older_.size(); ++i)
+        if (i != keep && older_[i].seq < oldest) oldest = older_[i].seq, slot = i;
+    }
+    OlderCheckpoint& o = older_[slot];
+    if (!o.buf) o.buf = std::make_unique<PinnedHostBuffer>(checkpoint_.bytes);
+    char* dst = static_cast<char*>(o.buf->data());
+    const char* src = static_cast<const char*>(checkpoint_.p);
+    CUDA_CHECK(cudaEventRecord(ev_ready_, rt_.stream()));  // after the last save and any restore reading this slot
+    CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, ev_ready_, 0));
+    auto copy = [&](std::size_t off, std::size_t bytes) {
+      if (bytes) CUDA_CHECK(cudaMemcpyAsync(dst + off, src + off, bytes, cudaMemcpyDeviceToHost, copy_stream_));
+    };
+    copy(0, rt_.checkpoint_bytes());
+    if (drafter_)
+      for (const auto& [off, bytes] : drafter_->checkpoint_spans(drafter_->checkpoint_length())) copy(checkpoint_drafter_ + off, bytes);
+    copy(checkpoint_logits_, logits_.bytes);
+    CUDA_CHECK(cudaEventRecord(ev_moved_, copy_stream_));
+    move_pending_ = true;
+    o.ids = checkpoint_ids_;
+    o.images = checkpoint_images_;
+    o.drafter_length = drafter_ ? drafter_->checkpoint_length() : 0;
+    o.drafter_extra = drafter_ ? drafter_->checkpoint_extra() : std::vector<std::int32_t>{};
+    o.seq = ++seq_;
   }
 
   // Whether `held` (the images of a state holding `prefix` tokens) are exactly the images among the first
@@ -383,6 +487,11 @@ class EngineGenerator final : public Generator {
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
   std::vector<ImageKey> state_images_, checkpoint_images_;  // images in the state / the checkpoint
+  std::vector<OlderCheckpoint> older_;  // earlier prompts' checkpoints in pinned host memory
+  std::uint64_t seq_ = 0;
+  cudaStream_t copy_stream_ = nullptr;
+  cudaEvent_t ev_ready_ = nullptr, ev_moved_ = nullptr;
+  bool move_pending_ = false;
   DeviceBuffer image_vals_, image_rows_;  // a chunk's image embeddings (bf16 [chunk, H]) and their rows
   std::mutex mutex_;
 };

@@ -122,6 +122,13 @@ for chunk in stream:
 
 Reasoning arrives as `reasoning_content` before the answer's `content`.
 
+**Follow-up requests** reuse the processed conversation: a prompt that extends the previous one (plus the answer
+as generated) only prefills the new part; otherwise the engine restores the longest prompt checkpoint that is a
+prefix of the new prompt: the last prompt's (in VRAM) or one of the 3 before it (pinned host memory, up to
+~430 MiB each, copied while the next prompt prefills). Agent clients that resend a recent tool result differently
+then re-read only the last turns instead of the whole conversation. `INGINE_PROMPT_CHECKPOINTS` (default 4, VRAM
+one included; 1: only the last) sets how many; the log's `reuse=` field shows the path each request took.
+
 ## Tests
 
 ```bash

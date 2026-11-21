@@ -76,6 +76,44 @@ int main() {
       ok &= good;
     }
   }
+  // Older checkpoints: B = A + the start of A's answer + a tool result X; then B2 rewrites the end of X (a
+  // client that sends a tool result differently the second time). B2 is no extension of the state nor of B's
+  // checkpoint, so it restores A's (moved to host memory when B's was saved) and must generate exactly what a
+  // state holding just A generates (the same prefill chunk boundaries). A later prompt extending B must not
+  // reuse B's checkpoint: B2's prefill rewrote the positions past A.
+  for (const auto& [name, sp] : {std::pair{"greedy", greedy}, std::pair{"sampled", sampled}}) {
+    const std::vector<std::int32_t> A = random_ids(700), X = random_ids(120), Xb = random_ids(40), Y = random_ids(30);
+    run(other, 4, sp);
+    const Out ga = run(A, 48, sp);
+    std::vector<std::int32_t> B = A;
+    B.insert(B.end(), ga.tokens.begin(), ga.tokens.begin() + 2);
+    B.insert(B.end(), X.begin(), X.end());
+    const Out gb = run(B, 48, sp);
+    std::vector<std::int32_t> B2(B.begin(), B.end() - 40);  // X's last 40 tokens replaced
+    B2.insert(B2.end(), Xb.begin(), Xb.end());
+    B2.insert(B2.end(), gb.tokens.begin(), gb.tokens.begin() + 2);
+    B2.insert(B2.end(), Y.begin(), Y.end());
+    const Out x = run(B2, 64, sp);
+    std::vector<std::int32_t> C = B;  // extends B (whose checkpoint is stale now)
+    C.insert(C.end(), Y.begin(), Y.end());
+    const Out c = run(C, 32, sp);
+    run(other, 4, sp);
+    run(A, 0, sp);
+    const Out z = run(B2, 64, sp);
+    run(other, 4, sp);
+    run(A, 0, sp);
+    const Out zc = run(C, 32, sp);
+    const bool good = gb.stats.reuse == Reuse::Checkpoint && x.stats.reuse == Reuse::OlderCheckpoint &&
+                      x.stats.reused_tokens == int(A.size()) && z.stats.reuse == Reuse::Extend &&
+                      z.stats.reused_tokens == int(A.size()) && x.tokens == z.tokens &&
+                      c.stats.reuse == Reuse::OlderCheckpoint && c.stats.reused_tokens == int(A.size()) &&
+                      c.tokens == zc.tokens;
+    std::printf("%s an older checkpoint restores the prompt before a rewritten one and generates the strict-prefix "
+                "path's tokens (%s): reuse %s/%s, reused %d/%d of %zu\n",
+                good ? "PASS" : "FAIL", name, to_string(x.stats.reuse), to_string(c.stats.reuse), x.stats.reused_tokens,
+                c.stats.reused_tokens, A.size());
+    ok &= good;
+  }
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

@@ -467,9 +467,29 @@ void Drafter::save_checkpoint(void* dst) {
 
 void Drafter::restore_checkpoint(const void* src) {
   if (src != checkpoint_) throw std::invalid_argument("Drafter::restore_checkpoint: not the last checkpoint saved");
+  restore_from(src, checkpoint_length_, checkpoint_extra_, checkpoint_clobbered_);
+  checkpoint_clobbered_ = false;
+}
+
+void Drafter::restore_copy(const void* src, int length, const std::vector<std::int32_t>& extra) {
+  const std::vector<std::int32_t> tokens = extra;  // may alias checkpoint_extra_
+  restore_from(src, length, tokens, true);
+  checkpoint_clobbered_ = true;  // the global slots now hold the copy's rows, not the last save's
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> Drafter::checkpoint_spans(int length) const {
+  const std::size_t fixed = 4 * LOCAL_BYTES + 2 * kd::WINDOW * sizeof(std::int32_t) + std::size_t(H) * 2;
+  const std::size_t live = std::size_t(std::min(length, ctx_)) * kd::KV_DIM * 2;
+  const std::size_t ring = std::size_t(ctx_) * kd::KV_DIM * 2;
+  return {{0, fixed}, {fixed, live}, {fixed + ring, live}};
+}
+
+// the checkpoint layout at src (device or host memory) back into the drafter, at `length` with context tokens
+// `extra`; global_slots: also copy the global-ring slots [0, min(length, ctx))
+void Drafter::restore_from(const void* src, int length, const std::vector<std::int32_t>& extra, bool global_slots) {
   const auto* s = static_cast<const std::byte*>(src);
   auto copy = [&](void* dst, std::size_t off, std::size_t bytes) {
-    CUDA_CHECK(cudaMemcpyAsync(dst, s + off, bytes, cudaMemcpyDeviceToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(dst, s + off, bytes, cudaMemcpyDefault, stream_));
   };
   std::size_t off = 0;
   for (int l : {0, 2}) {
@@ -483,18 +503,16 @@ void Drafter::restore_checkpoint(const void* src) {
   }
   copy(f_rnn_, off, std::size_t(H) * 2);
   off += std::size_t(H) * 2;
-  if (checkpoint_clobbered_) {
-    const std::size_t live = std::size_t(std::min(checkpoint_length_, ctx_)) * kd::KV_DIM * 2;
+  if (global_slots) {
+    const std::size_t live = std::size_t(std::min(length, ctx_)) * kd::KV_DIM * 2;
     copy(layers_[1].k_ctx, off, live);
     copy(layers_[1].v_ctx, off + std::size_t(ctx_) * kd::KV_DIM * 2, live);
   }
-  length_ = checkpoint_length_;
-  checkpoint_clobbered_ = false;
+  length_ = length;
   // the context tokens of the checkpoint: drop the ones added since (rebuild if they were reset meanwhile)
-  const bool prefix = short_extra_.size() >= checkpoint_extra_.size() &&
-                      std::equal(checkpoint_extra_.begin(), checkpoint_extra_.end(), short_extra_.begin());
-  set_context_rows(prefix ? int(checkpoint_extra_.size()) : 0);
-  if (!prefix) note_tokens(checkpoint_extra_);
+  const bool prefix = short_extra_.size() >= extra.size() && std::equal(extra.begin(), extra.end(), short_extra_.begin());
+  set_context_rows(prefix ? int(extra.size()) : 0);
+  if (!prefix) note_tokens(extra);
 }
 
 void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {

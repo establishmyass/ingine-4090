@@ -28,6 +28,7 @@
 
 #include <array>
 #include <cstdint>
+#include <utility>
 #include <filesystem>
 #include <map>
 #include <span>
@@ -107,6 +108,15 @@ class Drafter {
   void save_checkpoint(void* dst);
   void restore_checkpoint(const void* src);
 
+  // Older checkpoints, kept by the caller as copies (in any memory) of a save: the byte spans of a checkpoint
+  // that hold data for length L (all a copy needs), the last save's L and context tokens, and a restore from such
+  // a copy (always copies the global slots back; afterwards the last save counts as overwritten, so restoring
+  // it copies its slots back too).
+  std::vector<std::pair<std::size_t, std::size_t>> checkpoint_spans(int length) const;
+  int checkpoint_length() const { return checkpoint_length_; }
+  const std::vector<std::int32_t>& checkpoint_extra() const { return checkpoint_extra_; }
+  void restore_copy(const void* src, int length, const std::vector<std::int32_t>& extra);
+
   int vocab() const { return V_; }
 
   // Device scratch of the acceptance step (engine._accept), owned here so it is allocated once.
@@ -169,6 +179,7 @@ class Drafter {
   std::vector<std::uint8_t> short_in_;    // host: token has a row
   std::vector<std::int32_t> short_extra_; // host: the context tokens, in row order
   std::vector<std::int32_t> checkpoint_extra_;  // the context tokens of the checkpoint
+  void restore_from(const void* src, int length, const std::vector<std::int32_t>& extra, bool global_slots);
   void set_context_rows(int rows);        // drops context rows past `rows` (stream-ordered)
   kernels::dense::Matrix wkv_all_{};      // BF16 [3 * 2048, H]: the three layers' k/v context projections
   kernels::draft::CtxLayers ctx_layers_{};

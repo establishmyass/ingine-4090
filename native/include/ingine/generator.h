@@ -30,11 +30,13 @@ enum class Reuse {
   None,        // empty state, the whole prompt prefilled
   Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
   Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
+  OlderCheckpoint,  // restored a checkpoint of an earlier prompt (kept in host memory), the longest that matches
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
     case Reuse::Extend: return "extend";
     case Reuse::Checkpoint: return "checkpoint";
+    case Reuse::OlderCheckpoint: return "older-checkpoint";
     default: return "none";
   }
 }
