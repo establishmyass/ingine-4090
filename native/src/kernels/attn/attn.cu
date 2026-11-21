@@ -94,6 +94,23 @@ constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OF
 constexpr int R_SLIDING = 8600, R_FULL = 8664;
 constexpr int CS = 16;  // blocks per KV head = cluster size; block r outputs dims [8r, 8r + 8)
 constexpr int OD = D / CS;
+// Key-split blocks per KV head. With clusters (sm_120a) they are the cluster's CS blocks. sm_86 merges the
+// partials in attn_finish_kernel (still CS blocks, one per 8 output dims), so the split is free there and is
+// sized to fill the 82 SMs in one wave: M = 1 runs 2 blocks per SM (128 registers), M > 1 one (shared memory),
+// and 16 x 8 = 128 blocks ran M > 1 in two waves.
+#ifndef INGINE_ATTN_KS1
+#define INGINE_ATTN_KS1 20
+#endif
+#ifndef INGINE_ATTN_KSM
+#define INGINE_ATTN_KSM 10
+#endif
+#ifdef INGINE_AMPERE
+constexpr int ks_of(int M) { return M == 1 ? INGINE_ATTN_KS1 : INGINE_ATTN_KSM; }
+#else
+constexpr int ks_of(int) { return CS; }
+#endif
+constexpr int KS_MAX = INGINE_ATTN_KS1 > INGINE_ATTN_KSM ? (INGINE_ATTN_KS1 > CS ? INGINE_ATTN_KS1 : CS)
+                                                         : (INGINE_ATTN_KSM > CS ? INGINE_ATTN_KSM : CS);
 constexpr int MAXM = 8;
 constexpr int U = 2;  // key pairs per warp per register buffer
 constexpr int MAXWARPS = 8;
@@ -107,7 +124,7 @@ constexpr float INV_3 = 1.f / 3.f;
 // fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
 constexpr size_t WS_PART = 256;
 constexpr int PSTR = D + 4;
-constexpr size_t ws_part_bytes(int M) { return size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_part_bytes(int M) { return size_t(HKV) * KS_MAX * GQA * M * PSTR * 4; }
 #ifdef INGINE_AMPERE
 // sm_86 (no clusters): after the partials, what each head's owner writes at the end (new K/V rows bf16
 // [HKV][2][M][D], conv states fp32 [HKV][3][2][D]), staged for attn_finish_kernel.
@@ -374,7 +391,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // ---- K/V streaming: two register buffers; the first two are issued now, K/V before the rel_proj
     // columns (whose addresses wait for `pos`). Keys go to the blocks in tiles of 2 STEP, round robin, so
     // the expensive relative-bias tail (distance < 1024) is spread over the whole cluster.
-    constexpr int STEP = KW * 2 * U, TILE = 2 * STEP, STRIDE = CS * TILE;
+    constexpr int KS = ks_of(M);
+    constexpr int STEP = KW * 2 * U, TILE = 2 * STEP, STRIDE = KS * TILE;
     const int c0 = rank * TILE, old_end = L_old;
     auto load_kv = [&](Buf<KV>& b, const int base) {
 #pragma unroll
@@ -757,7 +775,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         __syncthreads();
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
-        float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;
+        float* part = p.part + size_t(g * KS + rank) * ROWS * PSTR;
         for (int idx = tid; idx < ROWS * (D / 4); idx += NT) {
             const int row = idx / (D / 4), d4 = idx % (D / 4);
             float mx = NEG_INIT;
@@ -979,16 +997,16 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             consume(1, 0, true);
         }
         int st = 0;
-        for (int base = rank * KT; base < L_old; base += CS * KT, st ^= 1) {
+        for (int base = rank * KT; base < L_old; base += KS * KT, st ^= 1) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
             if constexpr (F8) expand_kv(st); else convert_v(st);
             __syncthreads();  // tile landed for everyone; the previous tile's P V is done
-            if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
+            if (base + KS * KT < L_old) issue(st ^ 1, base + KS * KT);
             consume(st, base, false);
         }
 
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
-        float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;
+        float* part = p.part + size_t(g * KS + rank) * ROWS * PSTR;
 #pragma unroll
         for (int n = 0; n < NTN; ++n) {
 #pragma unroll
@@ -1101,12 +1119,13 @@ __global__ void __launch_bounds__(NT) attn_finish_kernel(const Params p) {
     if (FULL && p0 + M > p.cap) return;  // the main kernel returned too
 
     if (tid < ROWS * OD) {
+        constexpr int KS = ks_of(M);
         const int row = tid / OD, dim = rank * OD + tid % OD;
-        const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
-        float2 ml[CS];
-        float o[CS];
+        const float* src = p.part + size_t(g * KS) * ROWS * PSTR + row * PSTR;
+        float2 ml[KS];
+        float o[KS];
 #pragma unroll
-        for (int q = 0; q < CS; ++q) {
+        for (int q = 0; q < KS; ++q) {
             ml[q] = __ldcg(reinterpret_cast<const float2*>(src + q * ROWS * PSTR + D));
             o[q] = __ldcg(src + q * ROWS * PSTR + dim);
         }
@@ -1114,10 +1133,10 @@ __global__ void __launch_bounds__(NT) attn_finish_kernel(const Params p) {
         const float sink = __ldcg(prow + OFF_SINK + g * GQA + row % GQA) * LOG2E;
         float mx = sink;
 #pragma unroll
-        for (int q = 0; q < CS; ++q) mx = fmaxf(mx, ml[q].x);
+        for (int q = 0; q < KS; ++q) mx = fmaxf(mx, ml[q].x);
         float l = exp2f(sink - mx), a = 0.f;
 #pragma unroll
-        for (int q = 0; q < CS; ++q) {
+        for (int q = 0; q < KS; ++q) {
             const float f = exp2f(ml[q].x - mx);
             l += ml[q].y * f;
             a += o[q] * f;
@@ -1207,7 +1226,7 @@ Kernel select(int M) {
 // griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
 cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs) {
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(CS, HKV);
+    cfg.gridDim = dim3(ks_of(k.M), HKV);
     cfg.blockDim = dim3(NT);
     cfg.dynamicSmemBytes = k.smem;
     cfg.stream = stream;

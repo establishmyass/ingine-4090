@@ -134,7 +134,8 @@ std::string default_model_dir() {
 
 int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
-  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0;
+  int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, long_decode = 0, prefill_chunk = 2048, forced_items = 0,
+      forced_skip = 0;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, temperature = 0.0;
   double offload_experts = 0.0;
@@ -160,6 +161,9 @@ int main(int argc, char** argv) {
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
+  ap.option("--prefill-chunk", "", "prompt tokens per prefill chunk (default 2048)", &prefill_chunk);
+  ap.option("--long-decode", "", "after the --long-prompt prefill, decode N tokens at that context and time them",
+            &long_decode);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
             &forced);
   ap.option("--forced-items", "", "replay at most N items of --forced", &forced_items);
@@ -184,6 +188,7 @@ int main(int argc, char** argv) {
     options.offload_gib = offload_experts;
     options.offload_threads = offload_threads;
     options.offload_adaptive = !offload_static;
+    options.prefill_chunk = prefill_chunk;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;
@@ -258,11 +263,17 @@ int main(int argc, char** argv) {
       ids.resize(std::min<size_t>(ids.size(), size_t(long_prompt)));
       ingine::model::Sampling greedy;
       greedy.temperature = 0.0f;
-      const ingine::model::GenerateStats st =
-          gen->generate(ids, 1, greedy, {}, [](std::span<const int32_t>) { return true; });
+      const ingine::model::GenerateStats st = gen->generate(ids, std::max(1, long_decode), greedy, {},
+                                                            [](std::span<const int32_t>) { return true; });
       const double tok_s = double(ids.size()) / st.prefill_seconds;
       json += ", \"prefill\": {\"tokens\": " + std::to_string(ids.size()) + ", \"tok_s\": " + py_float(tok_s) + "}";
       std::printf("prefill %zu tokens: %.0f tok/s\n", ids.size(), tok_s);
+      if (long_decode > 1 && st.decode_seconds > 0) {
+        const double dtok = st.generated_tokens / st.decode_seconds;
+        json += ", \"long_decode\": {\"context\": " + std::to_string(ids.size()) + ", \"tok_s\": " + py_float(dtok) + "}";
+        std::printf("decode at %zu context: %.1f tok/s (%d tokens%s)\n", ids.size(), dtok, st.generated_tokens,
+                    st.spec_rounds ? (", " + std::to_string(st.spec_rounds) + " verify rounds").c_str() : "");
+      }
       std::fflush(stdout);
     }
     std::printf("%s}\n", json.c_str());

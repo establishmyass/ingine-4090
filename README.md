@@ -11,9 +11,9 @@ which made the engine, the abliteration and the 5090 installer; its README is ke
 
 | RTX 3090, Ryzen 9 9950X3D | |
 |---|---|
-| decode, greedy, 32K context | 131 tok/s (llama.cpp with the UD-Q4_K_XL GGUF on the same card: 56) |
-| decode with DSpark speculative decoding | 191 tok/s chat, 247 tok/s code |
-| prefill, 30K-token prompt | 4,350 tok/s |
+| decode, greedy, 32K context | 140 tok/s (llama.cpp with the UD-Q4_K_XL GGUF on the same card: 56); 105 tok/s after a 100K-token prompt |
+| decode with DSpark speculative decoding | 235-239 tok/s chat, 219-224 tok/s code |
+| prefill, 30K-token prompt | 5,240 tok/s (5,700 with `--prefill-chunk 4096`); 4,300 tok/s for 100K tokens |
 | context | 64K with everything in VRAM; 256K with `--offload-experts 4` |
 | boot to ready / first token | 2.5 s warm, 4.3-4.9 s cold / 74 ms |
 | image encoding (CPU) | 70-100 ms for a typical photo, 0.7 s for a 1280×1280 image |
@@ -23,6 +23,10 @@ which made the engine, the abliteration and the 5090 installer; its README is ke
 - **sm_86 port** ([PORT-3090.md](PORT-3090.md)): Blackwell-only features (FP4/FP8 conversion instructions,
   thread-block clusters, programmatic dependent launch) replaced with exact Ampere code paths; parity with the
   Python reference unchanged (KL 2.2e-3, top-1 0.979). The `120a` (RTX 5090) build still compiles.
+- **Ampere kernels** (PORT-3090.md, sm_86 kernel work): a warp-specialised prefill MoE GEMM (producer warps
+  decode NVFP4 / MXFP8 into a `cp.async` ring while consumer warps run `ldmatrix` + `mma.sync`, +33%), decode
+  `moe_down` and long-context attention sized for 82 SMs without clusters (one wave instead of two), all
+  bit-identical to the original arithmetic.
 - **Expert offloading** ([EXPERT-OFFLOAD.md](EXPERT-OFFLOAD.md)): `--offload-experts GIB` keeps that many GiB of
   experts only in pinned RAM, with an adaptive VRAM expert cache, AVX-512 CPU expert kernels during decode and
   staged prefill. Frees VRAM for long context: upstream's 256K-token DSpark profile fits the 3090.
@@ -85,6 +89,7 @@ Without `--ablation` it serves the original model (model id `inkling-2-mini`). U
 | `--offload-experts GIB` | experts kept only in RAM; `4` runs `--max-ctx 262144` on the 3090 |
 | `--image-max-tokens N`, `--vision-threads N`, `--no-vision` | image input (default 1024 tokens per image) |
 | `--temperature`, `--top-p`, `--top-k` | defaults for requests that omit them (else `generation_config.json`) |
+| `--prefill-chunk N` | prompt tokens per prefill chunk (default 2048, up to 7168): 4096 prefills ~8% faster for ~0.7 GB more VRAM |
 | `--max-queue N`, `--model-id NAME` | waiting requests (default 4), the id reported by the API |
 
 ## API

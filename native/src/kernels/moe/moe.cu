@@ -301,7 +301,7 @@ __device__ __forceinline__ unsigned long long global_ns() {
 // Waits until the CPU pool finished the sequence number cold_publish gave this visit (2 s timeout). Every block of
 // moe_down polls, so the poll backs off to 4 us: each read of host memory is a PCIe transaction the CPU's memory
 // fabric must snoop, and 144 blocks polling every 256 ns took a third of the bandwidth the pool streams with.
-__device__ void wait_cold(const ColdExchange& c) {
+__device__ __forceinline__ void wait_cold(const ColdExchange& c) {
     const uint32_t want = static_cast<uint32_t>(ld_dep(reinterpret_cast<const int*>(c.dev + 1)));
     const unsigned long long t0 = global_ns();
     unsigned sleep = 256;
@@ -615,6 +615,191 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     }
 }
 
+// ------------------------------------------------------------------------- moe_down per expert (sm_86)
+// Without programmatic dependent launch every kernel boundary drains the GPU, and moe_down's 144 blocks of 18
+// warps (one per SM: 82 registers) ran in two waves at ~50% of the DRAM bandwidth. On sm_86 moe_down instead
+// runs one block per (16-row tile, unique expert), 9 warps of one register-loaded step each, as moe_up does
+// (1152 blocks for M = 1, up to 5 resident per SM). Each block sums its 9 partial dots in order and rounds them
+// to BF16 exactly as moe_down_kernel (bit-identical), stores the expert outputs in a device buffer and counts
+// the tile's experts; the block completing a tile (last arriver) does the weighted sum and the post-MLP conv in
+// slot order over the stored outputs (deterministic) and resets the count for the next launch. 20% faster at
+// M = 1 (21 vs 26 us), 16% at M = 2, 4% at M = 8. (Measured and dropped: persistent grids with register or
+// cp.async pipelines, shared-memory staged tiles and 2-expert blocks: the NVFP4 decode, ~5.7 instructions per
+// weight without sm_120's cvt.e2m1x2, makes these kernels issue-bound near 75% of the bandwidth, and
+// smaller per-warp loads cost DRAM locality.)
+constexpr int PTILES = H / TILE;  // 144 tiles of 16 rows (W13: 2304 rows, W2: 2304 rows)
+#ifdef INGINE_MOE_ONESHOT
+constexpr bool kOneShot = true;   // benchmarking: the one-shot kernels on sm_86 too
+#else
+constexpr bool kOneShot = false;
+#endif
+
+// One slot per (token, k) of the largest call: BF16 expert outputs of moe_down blocks, and per-tile counts.
+__device__ uint16_t g_down_y[TOPK * MAXM * H];
+__device__ unsigned g_down_cnt[PTILES];
+
+// Per lane: slot s's expert is computed here (first occurrence of the expert, and in VRAM unless skip_cold).
+// Returns the number of such experts (popc over the 64 slots); `any_cold`: some unique expert is skipped.
+__device__ __forceinline__ int count_hot_unique(int lo, int hi, const ExpertTable* tab, bool skip_cold,
+                                                bool& any_cold) {
+    const int lane = threadIdx.x & 31;
+    const unsigned ml = __match_any_sync(0xffffffffu, lo), mh = __match_any_sync(0xffffffffu, hi);
+    unsigned bits[4];
+#pragma unroll
+    for (int wd = 0; wd < 4; ++wd)
+        bits[wd] = __reduce_or_sync(0xffffffffu, (lo >= 0 && (lo >> 5) == wd) ? 1u << (lo & 31) : 0u);
+    const bool first_lo = lo >= 0 && lane == __ffs(ml) - 1;
+    const int hw = hi >> 5;  // select, not index: an indexed local array would live in local memory
+    const unsigned hb = hw == 0 ? bits[0] : hw == 1 ? bits[1] : hw == 2 ? bits[2] : bits[3];
+    const bool first_hi = hi >= 0 && lane == __ffs(mh) - 1 && !((hb >> (hi & 31)) & 1u);
+    const bool cold_lo = first_lo && skip_cold && !tab->hot[lo];
+    const bool cold_hi = first_hi && skip_cold && !tab->hot[hi];
+    any_cold = __any_sync(0xffffffffu, cold_lo || cold_hi);
+    return __popc(__ballot_sync(0xffffffffu, first_lo && !cold_lo)) +
+           __popc(__ballot_sync(0xffffffffu, first_hi && !cold_hi));
+}
+
+// Release / acquire fences of the last-arriver protocol (lighter than __threadfence's fence.sc).
+__device__ __forceinline__ void fence_acq_rel_gpu() { asm volatile("fence.acq_rel.gpu;" ::: "memory"); }
+
+__device__ __forceinline__ float ld_cg_bf16(const uint16_t* p) {
+    uint16_t v;
+    asm volatile("ld.global.cg.u16 %0, [%1];" : "=h"(v) : "l"(p) : "memory");
+    return __uint_as_float(uint32_t(v) << 16);
+}
+
+// The weighted expert sum and post-MLP conv of one 16-channel tile, by warp 0 of the block that completed it.
+__device__ __forceinline__ void down_tile_epilogue(int tile, int M, const int* idx, const float* wts, const float* conv_w,
+                                   float* conv_state, float* out, float* conv_hist, const ExpertTable* tab,
+                                   bool cpu_cold, bool any_cold, const ColdExchange& cold,
+                                   float (&ep)[MAXM][TILE]) {
+    const int lane = threadIdx.x & 31;
+    fence_acq_rel_gpu();
+    if (any_cold) {
+        if (lane == 0) wait_cold(cold);
+        __syncwarp();
+    }
+    for (int pr = lane; pr < TILE * M; pr += 32) {
+        const int r = pr & (TILE - 1), n = pr / TILE;
+        const int ch = tile * TILE + r;
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < TOPK; ++k) {
+            const int sl = n * TOPK + k;
+            const bool c = cpu_cold && !tab->hot[ld_dep(idx + sl)];
+            const float y = c ? __uint_as_float(uint32_t(*reinterpret_cast<const volatile uint16_t*>(
+                                                    cold.y + static_cast<size_t>(sl) * H + ch))
+                                                << 16)
+                              : ld_cg_bf16(g_down_y + static_cast<size_t>(sl) * H + ch);
+            acc = __fadd_rn(acc, __fmul_rn(ld_dep(wts + sl), y));
+        }
+        ep[n][r] = bf16_round(acc);
+    }
+    __syncwarp();
+    if (lane < TILE) {
+        const int ch = tile * TILE + lane;
+        const float4 cw = *reinterpret_cast<const float4*>(conv_w + 4 * ch);
+        float ext[MAXM + 3];
+        ext[0] = ld_dep(conv_state + ch);
+        ext[1] = ld_dep(conv_state + H + ch);
+        ext[2] = ld_dep(conv_state + 2 * H + ch);
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) ext[m + 3] = m < M ? ep[m][lane] : 0.f;
+        constexpr float inv_sqrt5 = 1.f / 2.2360679774997896f;
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) {
+            if (m < M) {
+                float acc = __fmul_rn(cw.x, ext[m]);
+                acc = __fadd_rn(acc, __fmul_rn(cw.y, ext[m + 1]));
+                acc = __fadd_rn(acc, __fmul_rn(cw.z, ext[m + 2]));
+                acc = __fadd_rn(acc, __fmul_rn(cw.w, ext[m + 3]));
+                out[static_cast<size_t>(m) * H + ch] = __fmul_rn(__fadd_rn(acc, ext[m + 3]), inv_sqrt5);
+                if (conv_hist) conv_hist[static_cast<size_t>(m) * H + ch] = ext[m + 3];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 3; ++j)
+#pragma unroll
+            for (int m = 1; m <= MAXM; ++m)
+                if (m == M) conv_state[j * H + ch] = ext[m + j];
+    }
+    if (lane == 0) g_down_cnt[tile] = 0u;  // ready for the next launch
+}
+
+// moe_down as one-shot blocks per (tile, unique expert): 9 warps, one register-loaded step (16 rows x 128
+// columns) each, as moe_up's blocks; the 9 partial dots are summed in order and rounded as in moe_down_kernel
+// (bit-identical), stored in g_down_y, and the tile's last block does the weighted sum and conv.
+template <int FMT>
+__global__ void __launch_bounds__(DOWN_GROUPS * 32)
+moe_down_rows(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
+              const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
+              const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
+              float* __restrict__ conv_hist, const ExpertTable* __restrict__ tab, ColdExchange cold) {
+    constexpr int K = I, R = H;
+    constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
+    __shared__ float red[DOWN_GROUPS][32][4];
+    __shared__ float ep[MAXM][TILE];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int tile = blockIdx.x, slot = blockIdx.y;
+    const int nslots = M * TOPK;
+    const bool cpu_cold = tab != nullptr && cold.cpu;
+    const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
+    const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
+    const int e = ld_dep(idx + slot);
+    const uint64_t mask = slot_mask(e, lo, hi);
+    const bool mine = __ffsll(static_cast<long long>(mask)) - 1 == slot && !(cpu_cold && !tab->hot[e]);
+    if (!mine && slot != 0) return;
+    const uint8_t *wr, *wsr;
+    if (tab) {
+        const size_t r = static_cast<size_t>(tile) * TILE + g;
+        wr = tab->w2[e] + r * CB, wsr = tab->w2s[e] + r * SB;
+    } else {
+        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+        wr = w + row * CB, wsr = ws + row * SB;
+    }
+    Frag<FMT> f;
+    if (mine) load_w<FMT, K>(f, wr, wsr, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f, l2::policy<WEIGHT_L2>());
+    bool any_cold;
+    const int NH = count_hot_unique(lo, hi, tab, cpu_cold, any_cold);
+    if (NH == 0) {  // every expert is on the CPU: the block of slot 0 finishes the tile
+        if (warp == 0)
+            down_tile_epilogue(tile, M, idx, wts, conv_w, conv_state, out, conv_hist, tab, cpu_cold, any_cold, cold, ep);
+        return;
+    }
+    if (!mine) return;
+    const uint32_t kg = g < M ? uint32_t(mask >> (8 * g)) & 0xffu : 0u;
+    load_x(f, kg ? act + (static_cast<size_t>(g) * TOPK + (__ffs(kg) - 1)) * K : nullptr, 4 * warp + t);
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    mma_frag(f, d);
+#pragma unroll
+    for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+    __syncthreads();
+    if (warp == 0) {
+        float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int j = 0; j < DOWN_GROUPS; ++j)
+#pragma unroll
+            for (int v = 0; v < 4; ++v) sacc[v] += red[j][lane][v];
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const int n = 2 * t + c;
+            const uint32_t kmask = n < M ? uint32_t(mask >> (8 * n)) & 0xffu : 0u;
+            if (!kmask) continue;
+            uint16_t* y = g_down_y + (static_cast<size_t>(n) * TOPK + (__ffs(kmask) - 1)) * H + tile * TILE + g;
+            y[0] = __bfloat16_as_ushort(__float2bfloat16_rn(sacc[c]));
+            y[8] = __bfloat16_as_ushort(__float2bfloat16_rn(sacc[2 + c]));
+        }
+        fence_acq_rel_gpu();
+        __syncwarp();
+        unsigned prev = 0;
+        if (lane == 0) prev = atomicAdd(&g_down_cnt[tile], 1u);
+        prev = __shfl_sync(0xffffffffu, prev, 0);
+        if (prev == unsigned(NH - 1))
+            down_tile_epilogue(tile, M, idx, wts, conv_w, conv_state, out, conv_hist, tab, cpu_cold, any_cold, cold, ep);
+    }
+}
+
 void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("moe: ") + what);
 }
@@ -663,6 +848,12 @@ void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts,
             "moe_down: incomplete cold-expert exchange");
     const bool nv = fmt == Format::NVFP4;
     const ColdExchange cx = cold ? *cold : ColdExchange{};
+    if constexpr (!kHasPdl && !kOneShot) {  // sm_86: blocks per (tile, unique expert), see above
+        launch(nv ? moe_down_rows<0> : moe_down_rows<1>, dim3(H / TILE, M * TOPK), DOWN_GROUPS * 32, false, stream,
+               act, idx, wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale),
+               nv ? w2_factor : nullptr, M, conv_w, conv_state, out, conv_hist, table, cx);
+        return;
+    }
     launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
            wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr,
            M, conv_w, conv_state, out, conv_hist, table, cx);

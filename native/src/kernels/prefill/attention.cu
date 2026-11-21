@@ -240,6 +240,31 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     const bool need_mask = !(allv && dmin >= 0 && (p.window == 0 || dmax < p.window));
     const bool need_bias = dmin < kRelExtent;
 
+    // the bias of every score of this thread, loaded before the S MMAs so the gathers overlap them
+    // (rel_logits rows are bf16 [T, 24, 1024]; d < 1024 only where the bias applies)
+#ifndef INGINE_PF_ATTN_NOBIAS
+    uint32_t bpk[BK / 8][2];
+    if (need_bias) {
+#pragma unroll
+      for (int nt = 0; nt < BK / 8; ++nt) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          uint32_t pr = 0;
+#pragma unroll
+          for (int c = 0; c < 2; ++c) {
+            const int jl = nt * 8 + (lane & 3) * 2 + c;
+            const int kp = EXPLICIT ? s.kpos[buf][jl] : kt * BK + jl;
+            const int d = qpos[r] - kp;
+            const bool ok = kp >= 0 && d >= 0 && d < kRelExtent && (EXPLICIT || kp < p.L);
+            const uint32_t v = ok ? uint32_t(__ldg(relp[r] + d)) : 0u;
+            pr |= v << (16 * c);
+          }
+          bpk[nt][r] = pr;
+        }
+      }
+    }
+#endif
+
     // ---- S = Q K^T
     float sc[BK / 8][4];
 #pragma unroll
@@ -269,7 +294,9 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
           const int kp = EXPLICIT ? s.kpos[buf][jl] : kt * BK + jl;
           const int d = qpos[r] - kp;
           const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || kp < p.L);
-          if (need_bias && ok && d < kRelExtent) x += bf2f(__ldg(relp[r] + d));
+#ifndef INGINE_PF_ATTN_NOBIAS
+          if (need_bias && ok && d < kRelExtent) x += bf2f(uint16_t(bpk[nt][r] >> (16 * (e & 1))));
+#endif
           x = ok ? x * kLog2e : -INFINITY;
         } else {
           x *= kLog2e;
