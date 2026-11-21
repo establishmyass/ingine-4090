@@ -101,7 +101,7 @@ template <int FMT, bool UP>
 __global__ void __launch_bounds__(NT, 1)
     moe_gemm_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
                     const float* __restrict__ factors, const __nv_bfloat16* __restrict__ a_src, MoeWork w,
-                    __nv_bfloat16* __restrict__ out) {
+                    __nv_bfloat16* __restrict__ out, const kernels::moe::ExpertTable* __restrict__ table) {
   constexpr int K = UP ? kHidden : kInter;
   constexpr int N = UP ? 2 * kInter : kHidden;
   constexpr int KS = K / BK;
@@ -135,9 +135,16 @@ __global__ void __launch_bounds__(NT, 1)
     }
     cp_commit();
   };
-  const int64_t wrow = int64_t(e) * N + n0 + (tid >> 1);
-  const uint8_t* codes_row = codes + wrow * CODE_ROW;
-  const uint8_t* scales_row = scales + wrow * SCALE_ROW;
+  const uint8_t *codes_row, *scales_row;
+  if (table) {  // offloading: the expert's own rows, in VRAM or (cold) read from host memory over PCIe
+    const int64_t r = n0 + (tid >> 1);
+    codes_row = (UP ? table->w13[e] : table->w2[e]) + r * CODE_ROW;
+    scales_row = (UP ? table->w13s[e] : table->w2s[e]) + r * SCALE_ROW;
+  } else {
+    const int64_t wrow = int64_t(e) * N + n0 + (tid >> 1);
+    codes_row = codes + wrow * CODE_ROW;
+    scales_row = scales + wrow * SCALE_ROW;
+  }
   const float factor = FMT == 0 ? __ldg(factors + e) : 1.f;
 
   const int wm = warp & 1, wn = warp >> 1;
@@ -221,12 +228,12 @@ __global__ void __launch_bounds__(NT, 1)
 
 template <int FMT, bool UP>
 void launch_gemm(const void* codes, const void* scales, const float* factors, const __nv_bfloat16* a, int T,
-                 const MoeWork& w, __nv_bfloat16* out, cudaStream_t stream) {
+                 const MoeWork& w, __nv_bfloat16* out, cudaStream_t stream, const kernels::moe::ExpertTable* table) {
   static const cudaError_t attr = cudaFuncSetAttribute(
       moe_gemm_kernel<FMT, UP>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(GemmSmem)));
   if (attr != cudaSuccess) throw std::runtime_error("prefill moe: shared memory attribute failed");
   moe_gemm_kernel<FMT, UP><<<moe_max_tiles(T) * NTILES_N, NT, sizeof(GemmSmem), stream>>>(
-      static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), factors, a, w, out);
+      static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), factors, a, w, out, table);
 }
 
 // Warp per token: sigmoid scores, 8 rounds of arg-max over s + bias (lowest expert on ties).
@@ -337,14 +344,14 @@ void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream) {
 
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream) {
-  if (e.fmt == 0) launch_gemm<0, true>(e.w13, e.w13_scale, e.w13_factor, x, T, w, act, stream);
-  else launch_gemm<1, true>(e.w13, e.w13_scale, nullptr, x, T, w, act, stream);
+  if (e.fmt == 0) launch_gemm<0, true>(e.w13, e.w13_scale, e.w13_factor, x, T, w, act, stream, e.table);
+  else launch_gemm<1, true>(e.w13, e.w13_scale, nullptr, x, T, w, act, stream, e.table);
 }
 
 void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
               cudaStream_t stream) {
-  if (e.fmt == 0) launch_gemm<0, false>(e.w2, e.w2_scale, e.w2_factor, act, T, w, down, stream);
-  else launch_gemm<1, false>(e.w2, e.w2_scale, nullptr, act, T, w, down, stream);
+  if (e.fmt == 0) launch_gemm<0, false>(e.w2, e.w2_scale, e.w2_factor, act, T, w, down, stream, e.table);
+  else launch_gemm<1, false>(e.w2, e.w2_scale, nullptr, act, T, w, down, stream, e.table);
 }
 
 void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream) {

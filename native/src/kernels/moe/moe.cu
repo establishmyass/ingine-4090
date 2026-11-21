@@ -275,13 +275,110 @@ __device__ __forceinline__ uint64_t slot_mask(int e, int lo, int hi) {
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
+// ------------------------------------------------------------------------- expert offloading hand-off
+// Pattern from Strata (src/kernels/cuda/elementwise.cu, verify_kernels.cu, MIT): the payload is stored and
+// fenced to system scope before the sequence number, the sequence number is incremented in device memory
+// (never a value captured into the graph), and the waiter gives up after a timeout and raises an error flag
+// instead of hanging the stream.
+
+__device__ __forceinline__ uint32_t ld_acquire_sys(const volatile uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ uint4 ld_volatile_v4(const void* p) {
+    uint4 v;
+    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p)
+                 : "memory");
+    return v;
+}
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// Waits until the CPU pool finished the sequence number cold_publish gave this visit (2 s timeout). Every block of
+// moe_down polls, so the poll backs off to 4 us: each read of host memory is a PCIe transaction the CPU's memory
+// fabric must snoop, and 144 blocks polling every 256 ns took a third of the bandwidth the pool streams with.
+__device__ void wait_cold(const ColdExchange& c) {
+    const uint32_t want = static_cast<uint32_t>(ld_dep(reinterpret_cast<const int*>(c.dev + 1)));
+    const unsigned long long t0 = global_ns();
+    unsigned sleep = 256;
+    while (static_cast<int32_t>(ld_acquire_sys(c.done) - want) < 0) {
+        __nanosleep(sleep);
+        if (sleep < 4096) sleep *= 2;
+        if (global_ns() - t0 > 2000000000ull) {
+            *c.err = 1u;
+            __threadfence_system();
+            break;
+        }
+    }
+}
+
+// One block of 256 threads per visit: count the selections, list the cold slots and, if there are any,
+// publish them with x to the CPU pool.
+__global__ void __launch_bounds__(256) cold_publish_kernel(ColdExchange ex, const ExpertTable* __restrict__ tab,
+                                                           const __nv_bfloat16* __restrict__ x,
+                                                           const int* __restrict__ idx, int M, int visit, int layer) {
+    __shared__ int sidx[TOPK * MAXM];
+    __shared__ int ncold;
+    const int t = threadIdx.x, nslots = M * TOPK;
+    if (t < nslots) {
+        const int e = ld_dep(idx + t);
+        sidx[t] = e;
+        atomicAdd(ex.counts + layer * kExperts + e, 1u);
+    }
+    __syncthreads();
+    if (!ex.cpu) return;
+    if (t == 0) {  // in slot order: the pool sees the same list for the same routing
+        int n = 0;
+        for (int s = 0; s < nslots; ++s)
+            if (!tab->hot[sidx[s]]) ex.bell->slot[n] = s, ex.bell->expert[n] = sidx[s], ++n;
+        ncold = n;
+        ex.bell->visit = uint32_t(visit), ex.bell->layer = uint32_t(layer), ex.bell->M = uint32_t(M);
+        ex.bell->n = uint32_t(n);
+    }
+    __syncthreads();
+    if (ncold == 0) {
+        if (t == 0) ex.dev[1] = 0u;
+        return;
+    }
+    const uint4* src = reinterpret_cast<const uint4*>(x);
+    volatile uint4* dst = reinterpret_cast<volatile uint4*>(&ex.bell->x[0][0]);
+    for (int i = t; i < M * H / 8; i += blockDim.x) {
+        const uint4 v = ld_dep(src + i);
+        dst[i].x = v.x, dst[i].y = v.y, dst[i].z = v.z, dst[i].w = v.w;
+    }
+    __threadfence_system();  // this thread's payload reaches host memory before the ring
+    __syncthreads();
+    if (t == 0) {
+        const uint32_t seq = ex.dev[0] + 1u;
+        ex.dev[0] = seq;
+        ex.dev[1] = seq;
+        __threadfence_system();
+        ex.bell->seq = seq;
+        __threadfence_system();
+    }
+}
+
+__global__ void apply_table_updates_kernel(ExpertTable* tables, TableUpdates up) {
+    const int i = threadIdx.x;
+    if (i < up.n) {
+        const TableUpdate& u = up.u[i];
+        ExpertTable& t = tables[u.layer];
+        t.w13[u.expert] = u.w13, t.w13s[u.expert] = u.w13s, t.w2[u.expert] = u.w2, t.w2s[u.expert] = u.w2s;
+        t.hot[u.expert] = u.hot;
+    }
+}
+
 // --------------------------------------------------------------------------------------- moe_up
 
 template <int FMT>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
-              __nv_bfloat16* __restrict__ out) {
+              __nv_bfloat16* __restrict__ out, const ExpertTable* __restrict__ tab, int skip_cold) {
     constexpr int K = H, R = 2 * I;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float red[UP_WARPS][32][4];
@@ -298,12 +395,19 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
     const int e = ld_dep(idx + slot);
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
+    if (skip_cold && !tab->hot[e]) return;                           // the CPU pool computes it
 
-    const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
+    const uint8_t *wr, *wsr;
+    if (tab) {  // offloading: the expert's rows wherever the placement table puts them
+        const size_t r = static_cast<size_t>(tile) * TILE + g;
+        wr = tab->w13[e] + r * CB, wsr = tab->w13s[e] + r * SB;
+    } else {
+        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+        wr = w + row * CB, wsr = ws + row * SB;
+    }
     Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
-                   l2::policy<WEIGHT_L2>());
+    load_w<FMT, K>(f, wr, wsr, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f, l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
     mma_frag(f, d);
@@ -347,7 +451,7 @@ __global__ void __launch_bounds__(DOWN_WARPS * 32)
 moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
                 int M, const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
-                float* __restrict__ conv_hist) {
+                float* __restrict__ conv_hist, const ExpertTable* __restrict__ tab, ColdExchange cold) {
     constexpr int K = I, R = H;
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
     __shared__ float part[DOWN_WARPS][32][4];        // per-warp partial dots of the current round
@@ -355,8 +459,11 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     __shared__ int uexp[TOPK * MAXM];                // unique experts in first-slot order
     __shared__ unsigned long long umask[TOPK * MAXM];  // slots selecting each unique expert
     __shared__ uint8_t slot_u[TOPK * MAXM];          // slot -> unique expert index
-    __shared__ int nuniq;
+    __shared__ uint8_t ucold[TOPK * MAXM];           // unique expert computed by the CPU pool (offloading)
+    __shared__ uint8_t hl[TOPK * MAXM];              // unique experts computed here, in order
+    __shared__ int nuniq, nhot;
     __shared__ float sbuf[MAXM][TILE];
+    const bool cpu_cold = tab != nullptr && cold.cpu;
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -375,15 +482,24 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
             const int e = __shfl_sync(0xffffffffu, s < 32 ? lo : hi, s & 31);
             const uint64_t mask = slot_mask(e, lo, hi);
             remaining &= ~mask;
-            if (lane == 0) uexp[u] = e, umask[u] = mask;
+            if (lane == 0) {
+                uexp[u] = e, umask[u] = mask;
+                ucold[u] = cpu_cold && !tab->hot[e];
+            }
             if ((mask >> lane) & 1) slot_u[lane] = uint8_t(u);
             if ((mask >> (lane + 32)) & 1) slot_u[lane + 32] = uint8_t(u);
         }
-        if (lane == 0) nuniq = u;
+        if (lane == 0) {
+            nuniq = u;
+            int nh = 0;
+            for (int i = 0; i < u; ++i)
+                if (!ucold[i]) hl[nh++] = uint8_t(i);
+            nhot = nh;
+        }
     }
     __syncthreads();
 
-    const int U = nuniq;
+    const int U = nuniq, NH = nhot;  // NH == U unless offloaded experts go to the CPU pool
     const int p = warp / DOWN_GROUPS, c = 4 * (warp % DOWN_GROUPS) + t;
     auto xrow = [&](int u) -> const __nv_bfloat16* {
         const uint32_t kmask = g < M ? uint32_t(umask[u] >> (8 * g)) & 0xffu : 0u;
@@ -392,33 +508,40 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
     auto load = [&](int u, Frag<FMT>& f) {
         const int e = uexp[u];
-        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT == 0 ? wfactor[e] : 1.f, wpol);
+        const uint8_t *wr, *wsr;
+        if (tab) {
+            const size_t r = static_cast<size_t>(tile) * TILE + g;
+            wr = tab->w2[e] + r * CB, wsr = tab->w2s[e] + r * SB;
+        } else {
+            const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+            wr = w + row * CB, wsr = ws + row * SB;
+        }
+        load_w<FMT, K>(f, wr, wsr, c, FMT == 0 ? wfactor[e] : 1.f, wpol);
     };
 
     // The first round's weights do not depend on moe_up: fetch them before waiting for it (PDL).
     Frag<FMT> nxt;
-    if (p < U) load(p, nxt);
+    if (p < NH) load(hl[p], nxt);
     pdl_wait();
-    if (p < U) load_x(nxt, xrow(p), c);
+    if (p < NH) load_x(nxt, xrow(hl[p]), c);
 #pragma unroll 1
-    for (int base = 0; base < U; base += DOWN_PAR) {
+    for (int base = 0; base < NH; base += DOWN_PAR) {
         const Frag<FMT> cur = nxt;
-        const int u = base + p;
-        if (u + DOWN_PAR < U) load(u + DOWN_PAR, nxt), load_x(nxt, xrow(u + DOWN_PAR), c);  // next round
+        const int q = base + p;
+        if (q + DOWN_PAR < NH) load(hl[q + DOWN_PAR], nxt), load_x(nxt, xrow(hl[q + DOWN_PAR]), c);  // next round
         float d[4] = {0.f, 0.f, 0.f, 0.f};
-        if (u < U) mma_frag(cur, d);
+        if (q < NH) mma_frag(cur, d);
 #pragma unroll
         for (int v = 0; v < 4; ++v) part[warp][lane][v] = d[v];
         __syncthreads();
-        if (threadIdx.x < DOWN_PAR * 32 && base + (threadIdx.x >> 5) < U) {
+        if (threadIdx.x < DOWN_PAR * 32 && base + (threadIdx.x >> 5) < NH) {
             const int pp = threadIdx.x >> 5;
             float s[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int j = 0; j < DOWN_GROUPS; ++j)
 #pragma unroll
                 for (int v = 0; v < 4; ++v) s[v] += part[pp * DOWN_GROUPS + j][lane][v];
-            float(&y)[TILE][MAXM] = ybuf[base + pp];
+            float(&y)[TILE][MAXM] = ybuf[hl[base + pp]];
             y[g][2 * t] = bf16_round(s[0]);
             y[g][2 * t + 1] = bf16_round(s[1]);
             y[g + 8][2 * t] = bf16_round(s[2]);
@@ -428,13 +551,35 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     }
     pdl_trigger();  // only the short epilogue remains; dependents still wait for our completion
 
+    // Offloaded experts: wait for the CPU pool's outputs of this visit, then stage this tile's 16 rows of every
+    // cold slot (one 32-byte read over PCIe each) in `part`, which the last round no longer needs.
+    float(*ycold)[TILE] = reinterpret_cast<float(*)[TILE]>(&part[0][0][0]);  // [64 slots][16 rows]
+    if (NH < U) {
+        if (threadIdx.x == 0) wait_cold(cold);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nslots * 2; i += blockDim.x) {
+            const int sl = i >> 1, h = i & 1;
+            if (ucold[slot_u[sl]]) {
+                const uint4 v = ld_volatile_v4(cold.y + static_cast<size_t>(sl) * H + tile * TILE + h * 8);
+                const uint32_t wv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    ycold[sl][h * 8 + 2 * j] = __uint_as_float(wv[j] << 16);
+                    ycold[sl][h * 8 + 2 * j + 1] = __uint_as_float(wv[j] & 0xffff0000u);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
     if (threadIdx.x < TILE * M) {
         const int r = threadIdx.x & (TILE - 1), n = threadIdx.x / TILE;
         float s = 0.f;
 #pragma unroll
         for (int k = 0; k < TOPK; ++k) {
             const int sl = n * TOPK + k;
-            s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), ybuf[slot_u[sl]][r][n]));
+            const int u = slot_u[sl];
+            s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), ucold[u] ? ycold[sl][r] : ybuf[u][r][n]));
         }
         sbuf[n][r] = bf16_round(s);
     }
@@ -493,27 +638,49 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 }  // namespace
 
 void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, const void* w13_scale,
-            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream) {
+            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream,
+            const ExpertTable* table, bool skip_cold) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
-    require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
+    require(x && idx && (table || (w13 && w13_scale)) && out, "moe_up: null argument");
     require(fmt == Format::MXFP8 || w13_factor, "NVFP4 experts need a factor tensor");
+    require(table || !skip_cold, "moe_up: skip_cold needs a placement table");
     const bool nv = fmt == Format::NVFP4;
     const dim3 grid(2 * I / TILE, M * TOPK);
     launch(nv ? moe_up_kernel<0> : moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx,
            static_cast<const uint8_t*>(w13), static_cast<const uint8_t*>(w13_scale), nv ? w13_factor : nullptr, M,
-           out);
+           out, table, int(skip_cold));
 }
 
 void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
-              float* out, float* conv_hist, bool pdl, cudaStream_t stream) {
+              float* out, float* conv_hist, bool pdl, cudaStream_t stream, const ExpertTable* table,
+              const ColdExchange* cold) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
-    require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
+    require(act && idx && wts && (table || (w2 && w2_scale)) && conv_w && conv_state && out,
+            "moe_down: null argument");
     require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
+    require(!(cold && cold->cpu) || (table && cold->done && cold->y && cold->dev && cold->err),
+            "moe_down: incomplete cold-expert exchange");
     const bool nv = fmt == Format::NVFP4;
+    const ColdExchange cx = cold ? *cold : ColdExchange{};
     launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
            wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr,
-           M, conv_w, conv_state, out, conv_hist);
+           M, conv_w, conv_state, out, conv_hist, table, cx);
+}
+
+void cold_publish(const ColdExchange& ex, const ExpertTable* table, const __nv_bfloat16* x, const int* idx, int M,
+                  int visit, int layer, cudaStream_t stream) {
+    require(M >= 1 && M <= MAXM, "M must be in 1..8");
+    require(table && x && idx && ex.counts && (!ex.cpu || (ex.bell && ex.dev)), "cold_publish: null argument");
+    cold_publish_kernel<<<1, 256, 0, stream>>>(ex, table, x, idx, M, visit, layer);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void apply_table_updates(ExpertTable* tables, const TableUpdates& updates, cudaStream_t stream) {
+    require(updates.n >= 0 && updates.n <= kMaxTableUpdates, "apply_table_updates: too many updates");
+    if (updates.n == 0) return;
+    apply_table_updates_kernel<<<1, kMaxTableUpdates, 0, stream>>>(tables, updates);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace ingine::kernels::moe

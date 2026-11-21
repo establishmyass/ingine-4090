@@ -3,6 +3,7 @@ add_library(ingine_kernels_dense STATIC
   mix.cu
   gates.cu
   router.cu
+  route_trace.cu
 )
 ingine_cuda_target(ingine_kernels_dense)
 ingine_internal_includes(ingine_kernels_dense)

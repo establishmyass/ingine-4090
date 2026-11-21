@@ -137,6 +137,9 @@ int main(int argc, char** argv) {
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, temperature = 0.0;
+  double offload_experts = 0.0;
+  int offload_threads = 8;
+  bool offload_static = false;
 
   ingine::serve::ArgParser ap("ingine-bench",
                               "End-to-end ingine speed: prefill tokens/s and greedy decode tokens/s for one request.");
@@ -150,6 +153,9 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
+  ap.option("--offload-experts", "GIB", "keep GIB of routed experts only in host memory (RAM) to free VRAM", &offload_experts);
+  ap.option("--offload-threads", "N", "CPU threads computing offloaded experts during decode (0: GPU reads them over PCIe)", &offload_threads);
+  ap.flag("--offload-static", "keep the starting expert placement (no adaptive swaps)", &offload_static);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
@@ -175,6 +181,9 @@ int main(int argc, char** argv) {
     options.kv_fp8 = kv_fp8;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
+    options.offload_gib = offload_experts;
+    options.offload_threads = offload_threads;
+    options.offload_adaptive = !offload_static;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

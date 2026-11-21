@@ -9,6 +9,8 @@
 // attention / MLP writes happens inside the mixes that consume them, as in the decode step.
 #include "model/prefill.h"
 
+#include "offload/expert_store.h"
+
 #include "core/device.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
@@ -162,6 +164,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   int prev_v = -1;
   int tap = 0;
 
+  if (w_.store) w_.store->prefill_begin(T, s);  // expert offloading: stage cold experts per visit (long chunks)
   for (int v = 0; v < NUM_VISITS; ++v) {
     const int l = VISITS[v].layer, p = VISITS[v].pass;
     const Layer& layer = w.layers[l];
@@ -301,10 +304,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
     pk::moe_route(idx_, T, work, s);
     const Experts& ex = layer.experts;
-    const pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
+    pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
                             f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    if (w.store) me.table = w.store->prefill_table(v, s);
     pk::moe_gate_up(me, xm_, T, work, act_, s);
     pk::moe_down(me, act_, T, work, down_, s);
+    if (w.store) w.store->prefill_release(v, s);
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
     pk::conv_state_update(st.conv_mlp_at(v), moe_sum_, H, T, H, s);

@@ -4,13 +4,37 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "kernels/dense/dense.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <stdexcept>
 
 namespace ingine::model {
 namespace {
+
+// RuntimeOptions' offload fields, with $INGINE_OFFLOAD_GIB / _THREADS / _ADAPTIVE overriding them (tools, tests)
+offload::OffloadOptions offload_options(const RuntimeOptions& r) {
+  offload::OffloadOptions o;
+  o.gib = r.offload_gib;
+  o.threads = r.offload_threads;
+  o.adaptive = r.offload_adaptive;
+  if (const char* v = std::getenv("INGINE_OFFLOAD_GIB"); v && *v) o.gib = std::atof(v);
+  if (const char* v = std::getenv("INGINE_OFFLOAD_THREADS"); v && *v) o.threads = std::atoi(v);
+  if (const char* v = std::getenv("INGINE_OFFLOAD_ADAPTIVE"); v && *v) o.adaptive = std::atoi(v) != 0;
+  // placement tuning (defaults from Strata's adaptive tier): spare slots per class, steps between updates, decay
+  if (const char* v = std::getenv("INGINE_OFFLOAD_SPARES"); v && *v) o.spares = std::atoi(v);
+  if (const char* v = std::getenv("INGINE_OFFLOAD_SWAP_EVERY"); v && *v) o.swap_every = std::atoi(v);
+  if (const char* v = std::getenv("INGINE_OFFLOAD_DECAY"); v && *v) o.decay = float(std::atof(v));
+  if (const char* v = std::getenv("INGINE_OFFLOAD_RATIO"); v && *v) o.ratio = float(std::atof(v));
+  if (const char* v = std::getenv("INGINE_OFFLOAD_UNIFORM"); v && *v) o.uniform = std::atoi(v) != 0;
+  if (const char* v = std::getenv("INGINE_OFFLOAD_SPIN_US"); v && *v) o.spin_us = std::atoi(v);
+  if (const char* v = std::getenv("INGINE_OFFLOAD_STAGE_MIB"); v && *v) o.stage_mib = std::atoi(v);
+  o.cpu = o.threads > 0;
+  if (!o.cpu) o.threads = 1;
+  return o;
+}
 
 constexpr int kMaxWidth = 8;
 constexpr std::array<int, 3> kVerifyWidths = {2, 4, 8};
@@ -64,7 +88,7 @@ void GraphExec::launch(cudaStream_t stream) const {
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_);
+  weights_ = load_weights(options.model_dir, options.dense_fp8, stream_, offload_options(options));
   ablation_ = load_ablation(options.ablation);
   init();
 }
@@ -120,6 +144,7 @@ void Runtime::init() {
 
 Runtime::~Runtime() {
   if (stream_) cudaStreamSynchronize(stream_);
+  kernels::dense::route_trace_dump();  // INGINE_ROUTE_TRACE only
   for (auto& [m, exec] : graphs_) cudaGraphExecDestroy(exec);
   graphs_.clear();
   decoder_.reset();
@@ -184,9 +209,14 @@ void Runtime::set_inputs(std::span<const std::int32_t> tokens, int position) {
   set_step_inputs(tokens.data(), m, position, this->tokens(), pos(), stream_);
 }
 
+void Runtime::expert_tick() {
+  if (weights_.store) weights_.store->tick(stream_);
+}
+
 const float* Runtime::run_step(int m) {
   auto it = graphs_.find(m);
   if (it == graphs_.end()) throw std::invalid_argument("no decode graph for width " + std::to_string(m));
+  expert_tick();
   CUDA_CHECK(cudaGraphLaunch(it->second, stream_));
   return static_cast<const float*>(buffers(m).logits.data);
 }

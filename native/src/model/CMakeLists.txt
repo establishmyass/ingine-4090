@@ -21,6 +21,7 @@ target_link_libraries(ingine_model PUBLIC
   ingine_kernels_moe
   ingine_kernels_attn
   ingine_kernels_head
+  ingine_offload
   nlohmann_json::nlohmann_json
   CUDA::cudart)
 foreach(area prefill draft)

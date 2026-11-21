@@ -97,4 +97,11 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
 void embed(const std::int64_t* token, int M, const __nv_bfloat16* table, const float* norm_w, float* out,
            bool pdl, cudaStream_t stream);
 
+// Routing trace (route_trace.cu), for expert-placement studies: route_trace_path() is $INGINE_ROUTE_TRACE or
+// null; route_trace appends the M x 8 selections of one router call (idx int [M, 8]) at `visit`;
+// route_trace_dump writes the log to route_trace_path() (no-op without it).
+const char* route_trace_path();
+void route_trace(const int* idx, int M, int visit, cudaStream_t stream);
+void route_trace_dump();
+
 }  // namespace ingine::kernels::dense

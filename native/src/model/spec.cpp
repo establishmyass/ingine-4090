@@ -190,6 +190,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       record_event(0);
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
+    rt_.expert_tick();
     verify_.launch(stream);
     accept_.launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);

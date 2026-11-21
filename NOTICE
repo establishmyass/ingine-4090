@@ -38,6 +38,20 @@ kernels, the prefill, the DSpark drafter and the speculative decoding loop are
 written for Inkling-2-Mini; the decode kernels are ports of ingine's earlier
 PyTorch extension kernels.
 
+RTX 3090 port and expert offloading (native/src/offload, branch rtx3090)
+------------------------------------------------------------------------
+The expert-offloading design (pinned host experts with a VRAM expert cache,
+a decayed-LFU adaptive tier, the GPU-to-CPU doorbell hand-off inside CUDA
+graphs, the CPU worker pool's epoch-tagged claim protocol, per-core thread
+placement and the CPU expert kernels' row structure and prefetching) follows
+Strata, Copyright (c) 2026 Niko1221 and the Strata contributors, MIT License
+(https://github.com/Niko1221/Strata; src/kernels/cpu/nvfp4_avx512.cpp,
+include/strata/kernels/cpu/pool.hpp, include/strata/core/expert_cache.hpp,
+src/kernels/cuda/elementwise.cu, src/kernels/cuda/verify_kernels.cu), and
+fngine's hot/cold expert tiers. No Strata source file is copied verbatim; the
+adapted code is new and marked with references in its comments. Strata's
+copyright and MIT license notice: native/src/offload/LICENSE.strata.
+
 Vendored dependencies in native/third_party retain their original copyright
 and license notices:
 - cpp-httplib: native/third_party/cpp-httplib/LICENSE

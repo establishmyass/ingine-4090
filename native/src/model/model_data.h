@@ -8,9 +8,11 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_memory.h"
 #include "core/tensor.h"
 
 #include <array>
+#include <memory>
 #include <cstdint>
 #include <initializer_list>
 #include <vector>
@@ -191,6 +193,12 @@ struct Layer {
   Experts experts;
 };
 
+}  // namespace ingine::model
+namespace ingine::offload {
+class ExpertStore;
+}
+namespace ingine::model {
+
 // weights.Weights (+ fast.FastDecoder.final_norm1 / head_w). Owns its device memory.
 struct Weights {
   std::vector<Layer> layers;  // LAYERS
@@ -204,7 +212,17 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
+  // expert offloading: experts in pinned host memory + VRAM slots; then the layers' Experts tensors are empty
+  // and the kernels address experts through store->table(layer)
+  std::shared_ptr<offload::ExpertStore> store;
+  // embed in pinned host memory mapped into the device address space (embed_in_host_memory()): the
+  // kernels read the few rows they need over PCIe; empty when embed is in device memory.
+  MappedHostBuffer embed_host;
 };
+
+// Whether load_weights keeps the [VOCAB, H] BF16 embedding table (0.86 GiB) in pinned host memory instead
+// of VRAM: $INGINE_EMBED_HOST (0 / 1) if set, else on for the RTX 3090 (sm_86) build, off otherwise.
+bool embed_in_host_memory();
 
 // model.Ablation: per visit y <- y - w * r * (r . y) on the attention / MLP writes. Without an ablation
 // file (Ablation.none) directions and weights are zero.

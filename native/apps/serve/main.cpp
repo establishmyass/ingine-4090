@@ -68,6 +68,9 @@ int main(int argc, char** argv) {
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, fake_delay = 0.02;
+  double offload_experts = 0.0;
+  int offload_threads = 8;
+  bool offload_static = false;
   // sampling defaults; negative: from generation_config.json
   double temperature = -1, top_p = -1;
   int top_k = -1;
@@ -83,6 +86,9 @@ int main(int argc, char** argv) {
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
+  ap.option("--offload-experts", "GIB", "keep GIB of routed experts only in host memory (RAM) to free VRAM", &offload_experts);
+  ap.option("--offload-threads", "N", "CPU threads computing offloaded experts during decode (0: GPU reads them over PCIe)", &offload_threads);
+  ap.flag("--offload-static", "keep the starting expert placement (no adaptive swaps)", &offload_static);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
@@ -129,6 +135,9 @@ int main(int argc, char** argv) {
       options.kv_fp8 = kv_fp8;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
+      options.offload_gib = offload_experts;
+      options.offload_threads = offload_threads;
+      options.offload_adaptive = !offload_static;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

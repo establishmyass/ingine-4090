@@ -60,6 +60,12 @@ struct RuntimeOptions {
   int prefill_chunk = 2048;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
   float spec_threshold = 0.8f;
+  // Expert offloading (src/offload/expert_store.h): GiB of routed experts kept only in host memory (0: off;
+  // $INGINE_OFFLOAD_GIB overrides), CPU pool threads computing them during decode (0: the GPU reads them over
+  // PCIe instead; $INGINE_OFFLOAD_THREADS), adaptive placement ($INGINE_OFFLOAD_ADAPTIVE=0 freezes it).
+  double offload_gib = 0.0;
+  int offload_threads = 8;
+  bool offload_adaptive = true;
 };
 
 class Generator {

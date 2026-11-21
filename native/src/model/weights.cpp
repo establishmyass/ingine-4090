@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -165,7 +166,9 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+// offloaded: the routed experts stay out of VRAM (the ExpertStore reads them); their NVFP4 factors go to
+// `host` as well, for the CPU kernels.
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, offload::LayerExperts* host = nullptr) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -295,11 +298,14 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
-  ex.w13 = ld.raw(e + "w13_weight");
-  ex.w13_scale = ld.raw(e + "w13_weight_scale");
-  ex.w2 = ld.raw(e + "w2_weight");
-  ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  if (host == nullptr) {
+    ex.w13 = ld.raw(e + "w13_weight");
+    ex.w13_scale = ld.raw(e + "w13_weight_scale");
+    ex.w2 = ld.raw(e + "w2_weight");
+    ex.w2_scale = ld.raw(e + "w2_weight_scale");
+  }
   const bool nv = fmt == ExpertFormat::NVFP4;
+  if (host) host->fmt = nv ? offload::ExpertFmt::NVFP4 : offload::ExpertFmt::MXFP8;
   const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
   if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
       m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
@@ -311,6 +317,7 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
       std::vector<float> f(EXPERTS);
       for (int i = 0; i < EXPERTS; ++i) f[i] = amax[i] / den[den.size() == 1 ? 0 : i];  // FP32 division
       (std::string(w) == "w13" ? ex.w13_factor : ex.w2_factor) = ld.upload_f32(f, {EXPERTS});
+      if (host) (std::string(w) == "w13" ? host->f13 : host->f2) = f;
     }
   }
 
@@ -331,7 +338,17 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+bool embed_in_host_memory() {
+  if (const char* v = std::getenv("INGINE_EMBED_HOST"); v != nullptr && *v != '\0') return std::strcmp(v, "0") != 0;
+#ifdef INGINE_AMPERE
+  return true;
+#else
+  return false;
+#endif
+}
+
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const offload::OffloadOptions& offload) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
@@ -340,7 +357,11 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   w.storage.reserve(4096);
   Loader ld(m, up, stream, w.storage);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  std::vector<offload::LayerExperts> host_experts(offload.enabled() ? LAYERS : 0);
+  for (int l = 0; l < LAYERS; ++l)
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8,
+                                       offload.enabled() ? &host_experts[l] : nullptr));
+  if (offload.enabled()) w.store = std::make_shared<offload::ExpertStore>(m, host_experts, offload, stream);
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -356,7 +377,16 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
     w.message_queries = ld.upload_f32(mq, {n, 4, H});
   }
-  w.embed = ld.raw("model.llm.embed.weight");
+  if (embed_in_host_memory()) {
+    // Read straight from the file into pinned, device-mapped host memory: the same BF16 rows, fetched by
+    // the embed kernels (decode, prefill, drafter) over PCIe, one 4.6 KB row per token.
+    const SafetensorsRef ref = m.at("model.llm.embed.weight");
+    w.embed_host = MappedHostBuffer(ref->bytes);
+    ref.file->read_range(ref->offset, ref->bytes, w.embed_host.data());
+    w.embed = ref->view(w.embed_host.device_ptr());
+  } else {
+    w.embed = ld.raw("model.llm.embed.weight");
+  }
   if (w.embed.dtype != DType::BF16) throw std::runtime_error("weights: embed must be BF16");
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});

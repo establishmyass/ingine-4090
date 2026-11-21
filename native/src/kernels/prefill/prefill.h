@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "kernels/moe/moe.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -149,6 +151,9 @@ struct MoeExperts {
   const void* w2 = nullptr;
   const void* w2_scale = nullptr;
   const float* w2_factor = nullptr;
+  // expert offloading: per-expert addresses (VRAM slot or pinned host memory read over PCIe); the w13 / w2
+  // pointers above are then unused
+  const kernels::moe::ExpertTable* table = nullptr;
 };
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.

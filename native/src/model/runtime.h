@@ -16,6 +16,8 @@
 // it depends on has finished.
 #pragma once
 
+#include "offload/expert_store.h"
+
 #include "model/model_data.h"
 #include "model/model_kernels.h"
 
@@ -37,7 +39,8 @@ namespace ingine::model {
 
 // ---- loading (weights.load + FastDecoder._concat_projections/_stack_layer_params/_fp8_dense,
 // model.Ablation.load/none, model.State)
-Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream);
+Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cudaStream_t stream,
+                     const offload::OffloadOptions& offload = {});
 // One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory.
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
@@ -97,6 +100,9 @@ class Runtime {
  public:
   // Loads the weights (options.model_dir, dense_fp8) and ablation (options.ablation).
   explicit Runtime(const RuntimeOptions& options);
+  // Expert offloading: placement updates before a decode step launch (run_step calls it; the speculative loop
+  // before its verify launch). No-op without offloading.
+  void expert_tick();
   // Uses the given weights and ablation (tests, tools); options.model_dir and ablation are not read.
   Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation);
   ~Runtime();
