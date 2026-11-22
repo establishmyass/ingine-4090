@@ -9,10 +9,13 @@
 // * issues cp.async copies of its forget/gain row slices (rows [r * 144, +144), padded rows in shared
 //   memory) and 16-byte streaming loads of its 4 rows of `w_down` (2 warps per row: half 0 against n(h),
 //   half 1 against n(msg)) into registers;
-// * row norms: one block sum gives the sums of squares of h and msg of every token (each CTA computes all of
-//   them, so all CTAs normalise identically);
-// * down projection, one token at a time: bf16(x * rinv) is staged in shared memory (two buffers, so a token
-//   is staged while the previous one's dots finish) and every warp dots its row half against it;
+// * row norms and down projection, up to 4 tokens at a time (one for FP32 forget/gain slices: no room for
+//   more staging buffers): every thread loads its 9 inputs of h and of msg per token once and keeps them in
+//   registers; one block sum gives the group's sums of squares (each CTA computes all of them, so all CTAs
+//   normalise identically); bf16(x * rinv) is staged in shared memory, one buffer per token, and after one
+//   barrier every warp dots its row half against each. (The inputs are not read twice: with the slices in
+//   shared memory the L1 keeps little of them, and a second read is a second fetch from the L2: 0.8 us per
+//   call at M = 2, 3 us at M = 8.)
 // * the 4 BF16-rounded down outputs of a token go as one 16-byte st.async store to every CTA's copy of g
 //   [M, 64], completing on the receiver's mbarrier (dsmem.cuh: no cluster barrier round trip); this thread's
 //   h, msg, norm_w values load meanwhile;
@@ -25,7 +28,8 @@
 // them below a plain wait), h/msg are read after it.
 // Ported from engine/csrc/dense/gates.cu (torch launchers -> raw pointers). Results are bit-identical to that
 // kernel: same thread layout, expressions and order of every FP32 sum; changed are the barriers (norms of
-// all tokens in one reduction, single-barrier block sums, mbarrier exchanges) and the prefetch.
+// several tokens in one reduction, tokens staged in groups, single-barrier block sums, mbarrier exchanges),
+// the single read of the inputs and the prefetch.
 #include <cooperative_groups.h>
 
 #include "kernels/common/group_sync.cuh"
@@ -84,8 +88,7 @@ struct GateCfg {
   static constexpr int SLICE = CPC * RS;          // bytes of one padded matrix slice
   static_assert(CPC <= NT && ROW % 16 == 0 && RPC == 4, "uneven split");
   static constexpr int SMEM = 2 * SLICE;
-  // two staging buffers unless the FP32 slices leave no room for the second (then a barrier per token)
-  static constexpr int XBUF = FG32 ? 1 : 2;
+  static constexpr int XMAX = FG32 ? 1 : 4;       // tokens staged per barrier (one staging buffer each)
 };
 
 template <int CL, bool FG32, int M>
@@ -94,10 +97,13 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
   constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
   constexpr int MQ = (M + 3) / 4;    // 16-byte stores holding M values
+  constexpr int XG = M < C::XMAX ? M : C::XMAX;  // tokens per staging group
   static_assert(H % C::NT == 0, "x staging split");
   extern __shared__ __align__(16) uint8_t fg[];  // forget slice, then gain slice (padded rows)
   __shared__ __align__(16) float gall[M][RANK];  // full down output (BF16 values), received
-  __shared__ __align__(16) __nv_bfloat16 xs[C::XBUF][2 * H];  // bf16([n(h), n(msg)]) of a token
+  // bf16([n(h), n(msg)]) of the tokens of a group (M = 1 with FP16 slices: two, the shared-memory size the
+  // plain step was tuned with)
+  __shared__ __align__(16) __nv_bfloat16 xs[M == 1 && C::XMAX > 1 ? 2 : XG][2 * H];
   __shared__ __align__(16) float part[M][2][C::RPC];  // per-half partial dots
   __shared__ __align__(16) float ssall[CL][4 * MQ];   // per-CTA sums of squares of the gated output, received
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
@@ -127,16 +133,6 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   cluster_arrive_relaxed();  // waited for before the first remote store
 #endif
 
-  // inputs: XPT of h and of msg per thread, coalesced (activations: loaded after the PDL wait)
-  float xh[XPT], xm[XPT];
-  auto load_x = [&](int m) {
-#pragma unroll
-    for (int k = 0; k < XPT; ++k) {
-      xh[k] = hg[size_t(m) * H + k * C::NT + t];
-      xm[k] = mg[size_t(m) * H + k * C::NT + t];
-    }
-  };
-
   // forget/gain slices (padded rows) -> shared memory, asynchronous, waited for before the forget/gain phase
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   {
@@ -163,48 +159,60 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   pdl_wait_fenced(a.zero);
   pdl_trigger();
 
-  // row norms of every token: thread partials (9 inputs per half), then one block sum for the 2 M values
-  float ss[2 * M];
+  // row norms and down projection, XG tokens at a time (see above)
 #pragma unroll
-  for (int m = 0; m < M; ++m) {
-    load_x(m);
-    float sh = 0.f, sm = 0.f;
+  for (int m0 = 0; m0 < M; m0 += XG) {
+    if (m0 > 0) __syncthreads();  // the previous group's dots are done with the staging buffers
+    // inputs: XPT of h and of msg per thread and token, coalesced; thread partials of the sums of squares
+    float xh[XG][XPT], xm[XG][XPT], ss[2 * XG];
 #pragma unroll
-    for (int k = 0; k < XPT; ++k) {
-      sh = fmaf(xh[k], xh[k], sh);
-      sm = fmaf(xm[k], xm[k], sm);
+    for (int j = 0; j < XG; ++j) {
+      const int m = m0 + j;
+      float sh = 0.f, sm = 0.f;
+      if (m < M) {
+#pragma unroll
+        for (int k = 0; k < XPT; ++k) {
+          xh[j][k] = hg[size_t(m) * H + k * C::NT + t];
+          xm[j][k] = mg[size_t(m) * H + k * C::NT + t];
+          sh = fmaf(xh[j][k], xh[j][k], sh);
+          sm = fmaf(xm[j][k], xm[j][k], sm);
+        }
+      }
+      ss[2 * j] = sh;
+      ss[2 * j + 1] = sm;
     }
-    ss[2 * m] = sh;
-    ss[2 * m + 1] = sm;
-  }
-  block_sum_bcast<2 * M, C::NW>(ss, red2);
-
-  // down projection, one token at a time: stage bf16(x * rinv) in shared memory, every warp dots its row half
-  // against it (M > 1: the inputs are read again, from L1)
+    block_sum_bcast<2 * XG, C::NW>(ss, red2);
 #pragma unroll
-  for (int m = 0; m < M; ++m) {
-    if constexpr (M > 1) load_x(m);
-    const float rh = rsqrtf(ss[2 * m] / H + EPS), rm = rsqrtf(ss[2 * m + 1] / H + EPS);
-    __nv_bfloat16* xb = xs[m % C::XBUF];
+    for (int j = 0; j < XG; ++j) {
+      if (m0 + j < M) {
+        const float rh = rsqrtf(ss[2 * j] / H + EPS), rm = rsqrtf(ss[2 * j + 1] / H + EPS);
+        __nv_bfloat16* xb = xs[j];
 #pragma unroll
-    for (int k = 0; k < XPT; ++k) {
-      xb[k * C::NT + t] = __float2bfloat16_rn(xh[k] * rh);
-      xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[k] * rm);
+        for (int k = 0; k < XPT; ++k) {
+          xb[k * C::NT + t] = __float2bfloat16_rn(xh[j][k] * rh);
+          xb[H + k * C::NT + t] = __float2bfloat16_rn(xm[j][k] * rm);
+        }
+      }
     }
     __syncthreads();
-    float acc = 0.f;
 #pragma unroll
-    for (int i = 0; i < DCH; ++i) {
-      float wf[8], xf[8];
-      unpack_bf16x8(wv[i], wf);
-      unpack_bf16x8(*reinterpret_cast<const uint4*>(&xb[half * H + (i * 32 + lane) * 8]), xf);
+    for (int j = 0; j < XG; ++j) {
+      const int m = m0 + j;
+      if (m < M) {
+        const __nv_bfloat16* xb = xs[j];
+        float acc = 0.f;
 #pragma unroll
-      for (int j = 0; j < 8; ++j) acc = fmaf(wf[j], xf[j], acc);
+        for (int i = 0; i < DCH; ++i) {
+          float wf[8], xf[8];
+          unpack_bf16x8(wv[i], wf);
+          unpack_bf16x8(*reinterpret_cast<const uint4*>(&xb[half * H + (i * 32 + lane) * 8]), xf);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc = fmaf(wf[e], xf[e], acc);
+        }
+        acc = group_sum<32>(acc);
+        if (lane == 0) part[m][half][rl] = acc;
+      }
     }
-    acc = group_sum<32>(acc);
-    if (lane == 0) part[m][half][rl] = acc;
-    // one staging buffer: this token's dots end before the next token is staged
-    if constexpr (C::XBUF == 1 && M > 1) __syncthreads();
   }
   __syncthreads();
 

@@ -1,7 +1,9 @@
 // Attention core (src/kernels/attn) against an FP64 oracle of KERNELS.md area `attn` (adapted from the PyTorch
 // engine's test_attn.py): sliding layers with an empty, partially filled, wrapped, and wrapped ring
 // holding stale speculative entries, M = 1..8; full layers at p0 = 0, 3000 and 9000 (log scaling active)
-// with BF16 and FP8 (E4M3) caches. Checks the output, the new cache rows, ring positions and conv states.
+// with BF16 and FP8 (E4M3) caches, plus every FP8 verify width M = 2..8 at p0 = 4637 (a partial last 64-key
+// tile). Checks the output, the new cache rows, ring positions and conv states; full layers also rerun with
+// random bytes in the rows at and after p0 + M (stale speculative rows) and require identical output bits.
 // Synthetic layer parameters; caches of 10016 rows (about 40 MB).
 #include "kernels/oracle.h"
 
@@ -9,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
 #include <string>
 
 using namespace ingine::test;
@@ -149,6 +152,7 @@ bool run(Rng& rng, const Case& cs) {
   a.out = out.get();
   attn::attn_decode(a, g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+  const std::vector<__nv_bfloat16> out_first = out.download();
 
   // ---- oracle: q / rel post-processing
   std::vector<double> q(size_t(M) * HQ * D), rel(size_t(M) * HQ * DREL), rl(size_t(M) * HQ * EXT);
@@ -279,6 +283,27 @@ bool run(Rng& rng, const Case& cs) {
     std::printf("%s %s kpos: %zu wrong\n", bad ? "FAIL" : "PASS", n.c_str(), bad);
     ok &= bad == 0;
   }
+  if (full) {
+    // Rows at and after p0 hold whatever earlier (rejected speculative) calls left there; the call writes rows
+    // p0 .. p0 + M - 1 itself. Re-run twice with fresh random bytes in all of them (NaN / Inf patterns
+    // included) and the conv states reset: the output must be bit-identical.
+    const size_t rb = size_t(C) * (fp8 ? 1 : 2);
+    size_t diff = 0;
+    for (int rep = 0; rep < 2; ++rep) {
+      std::vector<uint8_t> kb = cache.dk->download(), vb = cache.dv->download();
+      for (size_t i = size_t(p0) * rb; i < kb.size(); ++i) kb[i] = uint8_t(rng.next()), vb[i] = uint8_t(rng.next());
+      cache.dk->upload(kb);
+      cache.dv->upload(vb);
+      dck.upload(ck0);
+      dcv.upload(cv0);
+      attn::attn_decode(a, g_stream);
+      INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+      const std::vector<__nv_bfloat16> again = out.download();
+      for (size_t i = 0; i < again.size(); ++i) diff += std::memcmp(&again[i], &out_first[i], 2) != 0;
+    }
+    std::printf("%s %s stale rows after p0 + M: %zu output values differ\n", diff ? "FAIL" : "PASS", n.c_str(), diff);
+    ok &= diff == 0;
+  }
   return ok;
 }
 
@@ -328,6 +353,12 @@ int main() {
         c.name = std::string("full ") + (fp8 ? "fp8" : "bf16") + " p0=" + std::to_string(p0) + " M=" + std::to_string(M);
         ok &= run(rng, c);
       }
+  for (int M = 2; M <= 8; ++M) {  // every verify width, p0 not a multiple of the 64-key E4M3 tile
+    Case c;
+    c.full = true, c.fp8 = true, c.M = M, c.p0 = 4637;
+    c.name = "full fp8 p0=4637 M=" + std::to_string(M);
+    ok &= run(rng, c);
+  }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

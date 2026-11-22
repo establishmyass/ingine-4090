@@ -42,14 +42,20 @@
 //   reduced over the 16 lanes with xor shuffles; the bias rel . rel_proj[:, d] is reduced the same way
 //   and rounded to BF16, and skipped warp-uniformly when no key of the warp is within 1024. Online
 //   softmax in the log2 domain (q is pre-scaled by log2(e)/sqrt(128)), FP32 accumulators.
-// * Main loop, M > 1, on tensor cores: the block loads each tile of 32 keys once with cp.async into
-//   shared memory (own double-buffered region, the first tile issued before q / rel processing; with the
-//   tile's kpos and rel_proj window). Rows r = 3 token + head (8-padded). S^T = K Q^T with mma.m16n8k16
-//   bf16 (exact bf16 q, k; fp32 sums; 1/sqrt(128) applied to the sums), one (16 keys, 8 rows) item per
-//   warp; mask and relative bias per element; per-item row max and P = exp2(S - max) stored as fp16
-//   hi + lo (P - hi). Then O^T += V^T P^T with mma.m16n8k16 fp16 (V converted to fp16 in place, exact for
-//   RMS-normed values), warp w owning dims 16w..16w+15, each item rescaled to the running row max in
-//   registers. Two block barriers per tile. The owner runs the call's own keys first as a one-m-tile tile.
+// * Main loop, M > 1, on tensor cores: the block loads each tile of keys once with cp.async into shared
+//   memory (own region, the first tiles issued before q / rel processing). Rows r = 3 token + head
+//   (8-padded). S^T = K Q^T with mma.m16n8k16 bf16 (exact bf16 q, k; fp32 sums; 1/sqrt(128) applied to the
+//   sums), (16 keys, 8 rows) items dealt over the warps; mask and relative bias per element; per-item row
+//   max and P = exp2(S - max) stored as fp16 hi + lo (P - hi). Then O^T += V^T P^T with mma.m16n8k16 fp16
+//   (V in fp16, exact for RMS-normed values), warp w owning dims 16w..16w+15, each item rescaled to the
+//   running row max in registers. The owner runs the call's own keys first as a one-m-tile tile.
+//   BF16 caches: 32-key tiles, double-buffered, with kpos and the rel_proj window; V converted in place.
+//   E4M3 caches: 64-key tiles, two raw E4M3 tiles in flight; K mma fragments are read straight from the
+//   raw rows (4 bytes per row and k-step, widened in registers, the k order inside an mma permuted and q
+//   read with the same permutation), only V is widened to fp16 (a block pass into the staging region),
+//   and the next tile is issued as soon as the S items are done. Measured on the full-layer verify
+//   shapes (131K keys): M = 2 227 -> 169 us, M = 4 274 -> 191 us, M = 8 319 -> 286 us (32-key tiles,
+//   one in flight, K and V widened, before).
 // * The owner runs the key/value short convolutions of its head (+ key clip / value RMS norm) into shared
 //   memory; it is the only reader of those conv-state channels. Its global writes (conv states, new
 //   cache rows) come at the end. Sliding layers, M = 1: the ring slot and kpos it overwrites hold the
@@ -64,13 +70,13 @@
 //   its new keys / values to BF16 and then to E4M3 (round to nearest even, saturated to +-448) in shared
 //   memory, so the call's own keys are attended with exactly the values the cache will hold, and writes the
 //   E4M3 bytes at the end. M = 1 reads 8-byte vectors with the same lanes, dims and buffer depth (half the
-//   bytes in flight: the M = 1 kernels already use 128 registers). M > 1 copies a tile's E4M3 rows into the
-//   first half of its stage, then expands them in place to the BF16 K / FP16 V layout (each thread loads the
-//   chunks it copied, block barrier, writes); E4M3 values are exact in both.
+//   bytes in flight: the M = 1 kernels already use 128 registers). M > 1: see the main loop above.
 // * Capturable: no allocation, no host sync, current stream; positions come from `pos` on the device.
 // * Positions are int32 on the device (row offsets 64-bit); the host caps full caches at 2^30 rows.
 // Ported from engine/csrc/attn/attn.cu (kernel bodies unchanged; torch launcher -> raw pointers).
 #include "kernels/attn/attn.h"
+
+#include "kernels/common/l2.cuh"
 
 #include "core/device.h"
 #include "kernels/common/arch.cuh"
@@ -140,7 +146,7 @@ constexpr size_t ws_bytes(int M) { return WS_PART + ws_part_bytes(M); }
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
 // dynamic shared memory layout (floats), per M
-template <int M>
+template <int M, bool F8 = false>
 struct Smem {
     static constexpr int ROWS = GQA * M;
     // staged inputs (dead once the main loop starts)
@@ -159,14 +165,16 @@ struct Smem {
     static constexpr int RED_ML = RED_O + MAXWARPS * GQA * D;
     static constexpr int MERGE_END = RED_ML + MAXWARPS * GQA * 2;
     static constexpr int UNION_END = STAGE_END > MERGE_END ? STAGE_END : MERGE_END;
-    // M > 1: K/V tiles loaded by the whole block, double-buffered (own region, so the first tile is in
-    // flight while q / rel and the owner's convolutions are computed). K rows are bf16, V rows are
-    // converted to fp16 in place once landed; 16-byte chunks are XOR-swizzled by key.
-    static constexpr int KT = 32;                        // keys per tile
-    static constexpr int KVS = (UNION_END + 3) & ~3;     // 16-bit [2][KT][2][D] (as floats: 2 KT D)
-    static constexpr int KPS = KVS + (M > 1 ? 2 * KT * D : 0);  // kpos (int) [2][KT]
-    static constexpr int SRP = KPS + (M > 1 ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
-    static constexpr int TILE_END = SRP + (M > 1 ? 2 * DREL * (KT + MAXM) : 0);
+    // M > 1: K/V tiles loaded by the whole block (own region, so the first tiles are in flight while q /
+    // rel and the owner's convolutions are computed); 16-byte chunks are XOR-swizzled by key.
+    // BF16 caches: double-buffered 16-bit stages [2][KT][2][D], K rows bf16, V rows converted to fp16
+    // in place. E4M3 caches (full layers): two raw tiles [2][K: KT][D] + [V: KT][D] bytes (K chunks
+    // swizzled; K is read straight from them), V widened to fp16 in the staging region.
+    static constexpr int KT = F8 ? 64 : 32;              // keys per tile
+    static constexpr int KVS = (UNION_END + 3) & ~3;     // 32 KB either way
+    static constexpr int KPS = KVS + (M > 1 ? 2 * KT * 2 * D * (F8 ? 1 : 2) / 4 : 0);  // kpos (int) [2][KT]
+    static constexpr int SRP = KPS + (M > 1 && !F8 ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
+    static constexpr int TILE_END = SRP + (M > 1 && !F8 ? 2 * DREL * (KT + MAXM) : 0);
     // dedicated regions
     static constexpr int GATE = (TILE_END + 3) & ~3;     // this block's output gates [ROWS][OD]
     static constexpr int SINK = GATE + ROWS * OD;        // [ROWS]
@@ -287,18 +295,34 @@ __device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b) {
 
 // Loads of anything an earlier kernel writes (caches, kpos, pos) are coherent `asm volatile` with a memory
 // clobber, so the compiler cannot hoist them above griddepcontrol.wait (programmatic dependent launch).
-__device__ __forceinline__ uint4 ld_kv(const void* ptr) {
+// Cached K/V rows are read once per step (the next read of a ring row is a full step, ~1.5 GB of streams,
+// later): their L2 lines are filled evict-first (kernels/common/l2.cuh).
+constexpr l2::Evict KV_L2 = l2::Evict::first;
+
+__device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
     uint4 v;
-    asm volatile("ld.global.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(ptr)
-                 : "memory");
+    if constexpr (l2::hinted<KV_L2>)
+        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                     : "l"(ptr), "l"(pol)
+                     : "memory");
+    else
+        asm volatile("ld.global.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                     : "l"(ptr)
+                     : "memory");
     return v;
 }
 
-__device__ __forceinline__ uint2 ld_kv8(const void* ptr) {
+__device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
     uint2 v;
-    asm volatile("ld.global.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
+    if constexpr (l2::hinted<KV_L2>)
+        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
+                     : "=r"(v.x), "=r"(v.y)
+                     : "l"(ptr), "l"(pol)
+                     : "memory");
+    else
+        asm volatile("ld.global.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
     return v;
 }
 
@@ -319,11 +343,17 @@ __device__ __forceinline__ void cp4(float* dst, const float* src) {
                  : "memory");
 }
 
-// zero-filling variants: nothing is read when !ok
-__device__ __forceinline__ void cp16z(float* dst, const float* src, bool ok) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src),
-                 "r"(ok ? 16 : 0)
-                 : "memory");
+// zero-filling variants: nothing is read when !ok (cp16z: cached K/V rows, KV_L2 lines)
+__device__ __forceinline__ void cp16z(float* dst, const float* src, bool ok, std::uint64_t pol) {
+    if constexpr (l2::hinted<KV_L2>)
+        asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;" ::"r"(
+                         unsigned(__cvta_generic_to_shared(dst))),
+                     "l"(src), "r"(ok ? 16 : 0), "l"(pol)
+                     : "memory");
+    else
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(unsigned(__cvta_generic_to_shared(dst))),
+                     "l"(src), "r"(ok ? 16 : 0)
+                     : "memory");
 }
 
 __device__ __forceinline__ void cp4z(float* dst, const float* src, bool ok) {
@@ -358,7 +388,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<M>;
+    using L = Smem<M, F8>;
     extern __shared__ __align__(16) float sm[];
     __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
 
@@ -394,6 +424,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     constexpr int KS = ks_of(M);
     constexpr int STEP = KW * 2 * U, TILE = 2 * STEP, STRIDE = KS * TILE;
     const int c0 = rank * TILE, old_end = L_old;
+    const std::uint64_t kvpol = l2::policy<KV_L2>();
     auto load_kv = [&](Buf<KV>& b, const int base) {
 #pragma unroll
         for (int u = 0; u < U; ++u) {
@@ -403,11 +434,11 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             if (j < old_end) {
                 const size_t off = (size_t(j) * HKV + g) * D + c * 8;
                 if constexpr (F8) {
-                    b.k[u] = ld_kv8(kc + off);
-                    b.v[u] = ld_kv8(vc + off);
+                    b.k[u] = ld_kv8(kc + off, kvpol);
+                    b.v[u] = ld_kv8(vc + off, kvpol);
                 } else {
-                    b.k[u] = ld_kv(kc + off);
-                    b.v[u] = ld_kv(vc + off);
+                    b.k[u] = ld_kv(kc + off, kvpol);
+                    b.v[u] = ld_kv(vc + off, kvpol);
                 }
                 b.kp[u] = FULL ? j : int(ld_s64(p.kpos + j));
             }
@@ -441,23 +472,13 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     auto dbase_of = [&](const int base) {
         return FULL ? p0 - (base + KT - 1) : 1 + ((p0 - 1 - (base + KT - 1)) & (WIN - 1));
     };
-    auto issue = [&](const int st, const int base) {
-        if constexpr (F8) {  // E4M3 rows to the first half of the stage (expand_kv converts them in place)
-            char* raw = reinterpret_cast<char*>(kvs + st * KT * 2 * D);
-            for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
-                const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
-                const bool ok = j < L_old;
-                cp16z(reinterpret_cast<float*>(raw + 16 * i),
-                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok);
-            }
-        } else {
-            for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
-                const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
-                const bool ok = j < L_old;
-                cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
-                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8),
-                      ok);
-            }
+    auto issue = [&](const int st, const int base) {  // BF16 caches (the E4M3 path streams raw tiles below)
+        for (int i = tid; i < KT * 2 * (D / 8); i += NT) {
+            const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8), j = base + key;
+            const bool ok = j < L_old;
+            cp16z(reinterpret_cast<float*>(kvs + kv_off(st, key, kv, ch)),
+                  reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 8), ok,
+                  kvpol);
         }
         if constexpr (!FULL) {
             for (int i = tid; i < KT; i += NT)  // low word of the int64 position
@@ -470,6 +491,30 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 const int c2 = i / NE, e = i % NE, d = dbase + e;
                 const bool ok = d >= 0 && d < EXT;
                 cp4z(srp + (st * DREL + c2) * (KT + MAXM) + e, p.rel_proj + c2 * EXT + (ok ? d : 0), ok);
+            }
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    // E4M3 caches, M > 1: tile t of this block (keys rank KT + t CS KT ..) is copied as raw E4M3 rows into
+    // slot t % NRAW of the stage region: K rows with their 16-byte chunks XOR-swizzled by key (read
+    // straight into mma fragments), then V rows (widened to fp16 in the staging region, which is dead once
+    // q / rel and the owner's convs are done). Every call commits a group (empty past the end), so the
+    // group count per tile is fixed.
+    constexpr int NRAW = 2, RAWB = KT * 2 * D;  // E4M3 tiles in flight, bytes per tile
+    static_assert(!F8 || M == 1 || (NRAW * RAWB <= 2 * KT * 2 * D && KT * D * 2 <= L::UNION_END * 4),
+                  "E4M3 tiles and the widened V tile must fit the stage and staging regions");
+    char* const raw = reinterpret_cast<char*>(sm + L::KVS);
+    __half* const wv = reinterpret_cast<__half*>(sm);  // E4M3: the widened V tile [KT][D], chunks swizzled
+    auto issue_raw = [&](const int t) {
+        const int base = rank * KT + t * KS * KT;
+        if (base < L_old) {
+            for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
+                const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
+                const bool ok = j < L_old;
+                char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
+                cp16z(reinterpret_cast<float*>(dst),
+                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
+                      kvpol);
             }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
@@ -514,10 +559,18 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
 
-    asm volatile("cp.async.wait_all;" ::: "memory");
-    __syncthreads();
-    if constexpr (M > 1) {
-        if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
+    if constexpr (M > 1 && F8) {  // staged inputs as the oldest group, then the first NRAW tiles behind them
+        asm volatile("cp.async.commit_group;" ::: "memory");
+#pragma unroll 1
+        for (int t = 0; t < NRAW; ++t) issue_raw(t);
+        asm volatile("cp.async.wait_group %0;" ::"n"(NRAW) : "memory");
+        __syncthreads();
+    } else {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncthreads();
+        if constexpr (M > 1) {
+            if (rank * KT < L_old) issue(0, rank * KT);  // in flight during q / rel and the owner's work
+        }
     }
     // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
     INGINE_GRIDDEP_LAUNCH();
@@ -689,7 +742,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll
                 for (int i = 0; i < GQA; ++i) {
                     const float bias = hsum16(relv[i] * rp);
-                    if (need[u]) s[u][i] += bf16r(bias) * LOG2E;
+                    if (need[u]) s[u][i] = fmaf(bf16r(bias), LOG2E, s[u][i]);  // one rounding (as M > 1)
                 }
             }
         }
@@ -822,39 +875,30 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 }
             }
         };
-        // F8: the E4M3 rows of stage st (first half of the stage) to the BF16 K / FP16 V layout, in place
-        auto expand_kv = [&](const int st) {
-            constexpr int NCH = KT * 2 * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
-            static_assert(NCH * NT == KT * 2 * (D / 16), "chunks must divide over the block");
-            const uint4* raw = reinterpret_cast<const uint4*>(kvs + st * KT * 2 * D);
-            uint4 r[NCH];
-#pragma unroll
-            for (int n = 0; n < NCH; ++n) r[n] = raw[tid + n * NT];  // the chunks this thread copied
-            __syncthreads();  // every chunk is in registers before the stage is overwritten
+        // 16-bit offset of 16-byte chunk ch8 of row `key` in a [rows][D] tile, chunks XOR-swizzled by key
+        auto roff = [](int key, int ch8) { return key * D + ((ch8 ^ (key & 7)) * 8); };
+        // F8: the V rows of raw slot `slot` to fp16 in wv (exact for E4M3 values)
+        auto expand_v = [&](const int slot) {
+            constexpr int NCH = KT * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
+            static_assert(NCH * NT == KT * (D / 16), "chunks must divide over the block");
 #pragma unroll
             for (int n = 0; n < NCH; ++n) {
-                const int i = tid + n * NT, key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16);
-                const uint32_t w[4] = {r[n].x, r[n].y, r[n].z, r[n].w};
+                const int i = tid + n * NT, key = i / (D / 16), ch = i % (D / 16);
+                const uint4 r = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * D + key * D + ch * 16);
+                const uint32_t w[4] = {r.x, r.y, r.z, r.w};
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7: one 16-byte chunk of the row
+                for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7
                     uint32_t o[4];
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
                         const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
-                        o[e] = kv ? half2_of(f.x, f.y) : pack2(f.x, f.y);
+                        o[e] = half2_of(f.x, f.y);
                     }
-                    *reinterpret_cast<uint4*>(kvs + kv_off(st, key, kv, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
+                    *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                 }
             }
         };
 
-        // this warp's S item (16 keys of the tile, 8 rows) and the rel rows it needs for the bias
-        const bool qk = warp < KM * NTN;
-        const int km = warp % KM, nn = warp / KM, r0 = nn * 8 + 2 * t4;
-        float rel0[DREL], rel1[DREL];
-#pragma unroll
-        for (int k = 0; k < DREL; ++k)
-            rel0[k] = qk ? sm[L::RELD + r0 * DREL + k] : 0.f, rel1[k] = qk ? sm[L::RELD + (r0 + 1) * DREL + k] : 0.f;
         // this thread's output rows n*8 + 2 t4 (+1), dims 16 warp + gid (+8): accumulators and softmax state
         // (every warp tracks the same row statistics, so no shared running max is needed)
         float oacc[NTN][4], mrow[NTN][2], lrow[NTN][2];
@@ -866,27 +910,64 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         float2* itm = reinterpret_cast<float2*>(sm + L::ITM);  // per (key m-tile, row): item max, item sum
 
-        // Two barriers per tile: [S, item max, P relative to it, item sums] | [P V, rescaled per item]. The
-        // caller's barrier before the next tile protects P, itm and the stage.
-        auto consume = [&](const int st, const int base, const bool is_new) {
+        // One tile: [S items (16 keys x 8 rows) over the warps, item max, P relative to it, item sums] |
+        // barrier, mid() | [P V, rescaled per item]. The caller's barrier before the next tile protects P,
+        // itm and the tile. K comes from kaddr(key, chunk) (16-bit rows, ldmatrix) or, kraw, straight from a
+        // raw E4M3 tile (4 bytes per row and k-step, widened in registers; the k order inside an mma is
+        // permuted, and q is read with the same permutation); V from vaddr(key, chunk) (fp16 rows).
+        auto consume = [&](auto kaddr, auto vaddr, auto kraw_t, const char* kraw, const int st, const int base,
+                           const bool is_new, auto&& mid) {
+            constexpr bool KRAW = decltype(kraw_t)::value;
             const int nk = is_new ? 1 : KM;  // key m-tiles in use (the call's own keys fit in one)
-            if (qk && km < nk) {
-                float a4[4] = {0.f, 0.f, 0.f, 0.f};
+            // items (key m-tile km, 8-row tile nn): warp w takes km = w % nk and the row tiles nn = w / nk +
+            // j NW / nk, loading and widening each K fragment once for all of them
+            constexpr int NW = NT / 32, NPW = (NTN + NW / KM - 1) / (NW / KM);
+            const int km = warp % nk, nn0 = warp / nk, nstep = NW / nk;
+            float a4[NPW][4];
+#pragma unroll
+            for (int j = 0; j < NPW; ++j) a4[j][0] = a4[j][1] = a4[j][2] = a4[j][3] = 0.f;
+            if (nn0 < NTN) {
 #pragma unroll
                 for (int ks = 0; ks < D / 16; ++ks) {
-                    uint32_t af[4], bfr[2];
-                    {
+                    uint32_t af[4];
+                    if constexpr (KRAW) {  // a0/a2: dims 4 t4 .. + 3 of key gid; a1/a3: key gid + 8
+                        const int key = km * 16 + gid;
+                        const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16) + 4 * t4;
+                        const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr);
+                        const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 * D);
+                        const float2 f0 = e4m3x2_f2(u0 & 0xffffu), f1 = e4m3x2_f2(u1 & 0xffffu);
+                        const float2 f2 = e4m3x2_f2(u0 >> 16), f3 = e4m3x2_f2(u1 >> 16);
+                        af[0] = pack2(f0.x, f0.y), af[1] = pack2(f1.x, f1.y);
+                        af[2] = pack2(f2.x, f2.y), af[3] = pack2(f3.x, f3.y);
+                    } else {
                         const int q = lane >> 3, key = km * 16 + (q & 1) * 8 + (lane & 7);
-                        ldsm_x4(smem_u32(kvs + kv_off(st, key, 0, ks * 2 + (q >> 1))), af);
+                        ldsm_x4(smem_u32(kaddr(key, ks * 2 + (q >> 1))), af);
                     }
-                    {
-                        const int row = nn * 8 + (lane & 7), ch = ks * 2 + ((lane >> 3) & 1);
-                        ldsm_x2(smem_u32(qb + row * D + ((ch ^ (row & 7)) * 8)), bfr);
+#pragma unroll
+                    for (int j = 0; j < NPW; ++j) {
+                        const int nn = nn0 + j * nstep;
+                        if (nn < NTN) {
+                            uint32_t bfr[2];
+                            if constexpr (KRAW) {  // the same k permutation as af
+                                const int row = nn * 8 + gid, ch = 2 * ks + (t4 >> 1);
+                                const uint2 q2 =
+                                    *reinterpret_cast<const uint2*>(qb + row * D + ((ch ^ (row & 7)) * 8) + (t4 & 1) * 4);
+                                bfr[0] = q2.x, bfr[1] = q2.y;
+                            } else {
+                                const int row = nn * 8 + (lane & 7), ch = ks * 2 + ((lane >> 3) & 1);
+                                ldsm_x2(smem_u32(qb + row * D + ((ch ^ (row & 7)) * 8)), bfr);
+                            }
+                            mma_bf16(a4[j], af, bfr);
+                        }
                     }
-                    mma_bf16(a4, af, bfr);
                 }
+            }
+#pragma unroll
+            for (int jt = 0; jt < NPW; ++jt) {
+                const int nn = nn0 + jt * nstep, r0 = nn * 8 + 2 * t4;
+                if (nn >= NTN) break;
                 const int dbase = dbase_of(base);
-                const bool staged = !is_new && dbase < EXT;
+                const bool staged = !F8 && !is_new && dbase < EXT;  // E4M3 tiles stage no rel_proj window
                 float sv[4];
 #pragma unroll
                 for (int v = 0; v < 4; ++v) {  // (key gid | gid + 8, row 2 t4 | 2 t4 + 1)
@@ -894,9 +975,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                     const int kp = is_new ? (key < M ? p0 + key : -1) : (j < L_old ? (FULL ? j : kps[st * KT + key]) : -1);
                     const int d = p0 + t - kp;
                     const bool ok = row < ROWS && kp >= 0 && d >= 0 && (is_new || (kp < p0 && (FULL || d < WIN)));
-                    float s = a4[v] * QSCALE;
+                    float s = a4[jt][v] * QSCALE;
                     if (ok && d < EXT) {  // bias bf16(rel[row] . rel_proj[:, d])
-                        const float* rl = (v & 1) ? rel1 : rel0;
+                        const float* rl = sm + L::RELD + row * DREL;
                         const int e = d - dbase;
                         float b = 0.f;
                         if (is_new) {
@@ -905,11 +986,11 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                         } else if (staged && e >= 0 && e < NE) {
 #pragma unroll
                             for (int k = 0; k < DREL; ++k) b = fmaf(rl[k], srp[(st * DREL + k) * (KT + MAXM) + e], b);
-                        } else {  // ring wrap point / out-of-order ring: read the column
+                        } else {  // ring wrap point / out-of-order ring / E4M3 tile: read the column
 #pragma unroll
                             for (int k = 0; k < DREL; ++k) b = fmaf(rl[k], __ldg(p.rel_proj + k * EXT + d), b);
                         }
-                        s += bf16r(b) * LOG2E;
+                        s = fmaf(bf16r(b), LOG2E, s);  // one rounding at every M (as M = 1)
                     }
                     sv[v] = ok ? s : -INFINITY;
                 }
@@ -938,6 +1019,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 if (gid == 0) itm[km * NRP + r0] = make_float2(mx0, s0), itm[km * NRP + r0 + 1] = make_float2(mx1, s1);
             }
             __syncthreads();
+            mid();
             float f[KM][NTN][2];  // per item weight exp2(item max - new max) of each of this thread's rows
 #pragma unroll
             for (int n = 0; n < NTN; ++n) {
@@ -968,7 +1050,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 uint32_t af[4];
                 {
                     const int q = lane >> 3, key = ks * 16 + (q >> 1) * 8 + (lane & 7);
-                    ldsm_x4_t(smem_u32(kvs + kv_off(st, key, 1, warp * 2 + (q & 1))), af);
+                    ldsm_x4_t(smem_u32(vaddr(key, warp * 2 + (q & 1))), af);
                 }
 #pragma unroll
                 for (int n = 0; n < NTN; ++n) {
@@ -984,25 +1066,52 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 }
             }
         };
+        auto nothing = [] {};
+        using RawK = std::true_type;
+        using SmemK = std::false_type;
 
-        if (owner) {  // the call's own keys first, in stage 1, while tile 0 is in flight
+        // the call's own keys first (stage 1 of kvs; for E4M3 caches V rows 0..15 and K rows 32..47 of wv),
+        // while the first tiles are in flight
+        if (owner) {
             for (int i = tid; i < 16 * 2 * (D / 8); i += NT) {
                 const int key = i / (2 * (D / 8)), kv = (i / (D / 8)) % 2, ch = i % (D / 8);
                 uint4 u = make_uint4(0u, 0u, 0u, 0u);
                 if (key < M) u = reinterpret_cast<const uint4*>(&s_nkv[kv][key][0])[ch];
                 if (kv) u = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
-                *reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch)) = u;
+                uint4* dst = F8 ? reinterpret_cast<uint4*>(wv + (kv ? 0 : 32 * D) + roff(key, ch))
+                                : reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch));
+                *dst = u;
             }
             __syncthreads();
-            consume(1, 0, true);
+            if constexpr (F8)
+                consume([&](int key, int ch) { return reinterpret_cast<const __nv_bfloat16*>(wv + 32 * D + roff(key, ch)); },
+                        [&](int key, int ch) { return wv + roff(key, ch); }, SmemK{}, nullptr, 0, 0, true, nothing);
+            else
+                consume([&](int key, int ch) { return kvs + kv_off(1, key, 0, ch); },
+                        [&](int key, int ch) { return kvs + kv_off(1, key, 1, ch); }, SmemK{}, nullptr, 1, 0, true, nothing);
         }
-        int st = 0;
-        for (int base = rank * KT; base < L_old; base += KS * KT, st ^= 1) {
-            asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
-            if constexpr (F8) expand_kv(st); else convert_v(st);
-            __syncthreads();  // tile landed for everyone; the previous tile's P V is done
-            if (base + KS * KT < L_old) issue(st ^ 1, base + KS * KT);
-            consume(st, base, false);
+        if constexpr (F8) {
+            int t = 0;
+            for (int base = rank * KT; base < L_old; base += KS * KT, ++t) {
+                asm volatile("cp.async.wait_group %0;" ::"n"(NRAW - 1) : "memory");  // this thread's part of tile t
+                __syncthreads();  // tile t landed for everyone; the previous tile's P V is done with wv
+                expand_v(t % NRAW);
+                __syncthreads();
+                consume([&](int key, int ch) { return kvs + kv_off(0, key, 0, ch); },  // (unused: K is raw)
+                        [&](int key, int ch) { return wv + roff(key, ch); }, RawK{}, raw + (t % NRAW) * RAWB, 0, base,
+                        false, [&] { issue_raw(t + NRAW); });  // after the S items, this tile's slot is free
+            }
+        } else {
+            int st = 0;
+            for (int base = rank * KT; base < L_old; base += KS * KT, st ^= 1) {
+                asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
+                convert_v(st);
+                __syncthreads();  // tile landed for everyone; the previous tile's P V is done
+                if (base + KS * KT < L_old) issue(st ^ 1, base + KS * KT);
+                consume([&](int key, int ch) { return kvs + kv_off(st, key, 0, ch); },
+                        [&](int key, int ch) { return kvs + kv_off(st, key, 1, ch); }, SmemK{}, nullptr, st, base, false,
+                        nothing);
+            }
         }
 
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
@@ -1197,12 +1306,12 @@ Kernel kernel_of() {
     static const Kernel k = [] {
         const KernelFn f = attn_decode_kernel<M, FULL, F8>;
 #ifdef INGINE_AMPERE
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M>::BYTES)));
-        return Kernel{f, M, Smem<M>::BYTES, attn_finish_kernel<M, FULL, F8>};
+        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+        return Kernel{f, M, Smem<M, F8>::BYTES, attn_finish_kernel<M, FULL, F8>};
 #else
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M>::BYTES)));
-        return Kernel{f, M, Smem<M>::BYTES, nullptr};
+        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
+        return Kernel{f, M, Smem<M, F8>::BYTES, nullptr};
 #endif
     }();
     return k;

@@ -110,7 +110,8 @@ __device__ __forceinline__ void sum_total(float (&out)[N], const float* scratch)
 
 // The mix of token m. NS = states in the mix (blocks + new), Q = queries; NS == 1 && Q == 1 is the layer-0
 // path (no mix). red1/red2/red3: block sum scratch, [REF_W * block_sum_slots<N>()] for N = 1, NS + Q NS, Q.
-template <int NS, int Q>
+// COPIES: the call has side row copies (a.copies); without, the kernel carries no code for them.
+template <int NS, int Q, bool COPIES>
 __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, float* red2, float* red3) {
   constexpr bool SKIP = NS == 1 && Q == 1;
   constexpr int NV = NS + Q * NS;  // sums of squares + query dots
@@ -142,14 +143,22 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
 
   pdl_wait_fenced(a.zero);  // keeps the constant loads above ahead of the wait
   pdl_trigger();
-  // side copies first: their loads fly during the mix
+  // side copies: their loads are issued first and fly during the mix; the stores come after the states'
+  // loads below. (A store waits for its value: stores ahead of the state loads put a round trip in front of
+  // them, measured +0.7 us per mix with two copies.) CPT 16-byte pieces per thread and copy are held in
+  // registers (rows up to CPT * MIX_T * 4 floats); longer rows finish with a plain loop.
+  constexpr int CPT = 2;
+  uint4 cv[2][CPT];
+  if constexpr (COPIES) {
 #pragma unroll
-  for (int c = 0; c < 2; ++c) {
-    const MixRowCopy& cp = a.copies[c];
-    if (!cp.dst) continue;
-    const float4* src = reinterpret_cast<const float4*>(cp.src + m * cp.src_stride);
-    float4* dst = reinterpret_cast<float4*>(cp.dst + m * cp.dst_stride);
-    for (int k = t; k < cp.cols / 4; k += MIX_T) dst[k] = src[k];
+    for (int c = 0; c < 2; ++c) {
+      const MixRowCopy& cp = a.copies[c];
+      if (!cp.dst) continue;
+      const float* src = cp.src + m * cp.src_stride;
+#pragma unroll
+      for (int j = 0; j < CPT; ++j)
+        if (t + j * MIX_T < cp.cols / 4) cv[c][j] = ld_act(src + 4 * (t + j * MIX_T));
+    }
   }
   float4 nw[MIX_V], y[MIX_V];
 #pragma unroll
@@ -158,6 +167,19 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
     for (int i = 0; i < NS - 1; ++i) s[i][u] = ld4(bp[i] + row + ch(u));
     nw[u] = a.base ? ld4(a.base + row + ch(u)) : make_float4(0.f, 0.f, 0.f, 0.f);
     if (a.write) y[u] = ld4(a.write + row + ch(u));
+  }
+  if constexpr (COPIES) {
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const MixRowCopy& cp = a.copies[c];
+      if (!cp.dst) continue;
+      const float4* src = reinterpret_cast<const float4*>(cp.src + m * cp.src_stride);
+      float4* dst = reinterpret_cast<float4*>(cp.dst + m * cp.dst_stride);
+#pragma unroll
+      for (int j = 0; j < CPT; ++j)
+        if (t + j * MIX_T < cp.cols / 4) *reinterpret_cast<uint4*>(dst + t + j * MIX_T) = cv[c][j];
+      for (int k = t + CPT * MIX_T; k < cp.cols / 4; k += MIX_T) dst[k] = src[k];
+    }
   }
 
   // new = base + (write - (w * (write . r)) * r)
@@ -292,29 +314,36 @@ __device__ __forceinline__ void mix_token(const MixArgs& a, int m, float* red1, 
   }
 }
 
-template <int NS, int Q>
+template <int NS, int Q, bool COPIES>
 __global__ void __launch_bounds__(MIX_T) mix_kernel(MixArgs a) {
   __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * block_sum_slots<NS + Q * NS>()],
       red3[REF_W * block_sum_slots<Q>()];
-  mix_token<NS, Q>(a, blockIdx.x, red1, red2, red3);
+  mix_token<NS, Q, COPIES>(a, blockIdx.x, red1, red2, red3);
 }
 
 // Two independent mixes in one launch: CTAs [0, a.M) run `a` (NS states, Q queries), CTAs [a.M, 2 a.M) run
-// the message mix `b` (one block, four queries). One kernel boundary less on the message visits.
+// the message mix `b` (one block, four queries). One kernel boundary less on the message visits. No row
+// copies (the launcher rejects them).
 template <int NS, int Q>
 __global__ void __launch_bounds__(MIX_T) mix_pair_kernel(MixArgs a, MixArgs b) {
   __shared__ float red1[REF_W * block_sum_slots<1>()], red2[REF_W * 32], red3[REF_W * MAXQ];
-  if (static_cast<int>(blockIdx.x) < a.M) mix_token<NS, Q>(a, blockIdx.x, red1, red2, red3);
-  else mix_token<2, 4>(b, blockIdx.x - a.M, red1, red2, red3);
+  if (static_cast<int>(blockIdx.x) < a.M) mix_token<NS, Q, false>(a, blockIdx.x, red1, red2, red3);
+  else mix_token<2, 4, false>(b, blockIdx.x - a.M, red1, red2, red3);
+}
+
+template <int NS, int Q>
+void launch_mix(int M, const MixArgs& a, bool pdl, cudaStream_t stream) {
+  if (a.copies[0].dst || a.copies[1].dst) launch_ex(mix_kernel<NS, Q, true>, dim3(M), MIX_T, 0, 1, pdl, stream, a);
+  else launch_ex(mix_kernel<NS, Q, false>, dim3(M), MIX_T, 0, 1, pdl, stream, a);
 }
 
 template <int NS>
 void launch_mix_q(int Q, int M, const MixArgs& a, bool pdl, cudaStream_t stream) {
   switch (Q) {
-    case 1: launch_ex(mix_kernel<NS, 1>, dim3(M), MIX_T, 0, 1, pdl, stream, a); break;
-    case 2: launch_ex(mix_kernel<NS, 2>, dim3(M), MIX_T, 0, 1, pdl, stream, a); break;
-    case 3: launch_ex(mix_kernel<NS, 3>, dim3(M), MIX_T, 0, 1, pdl, stream, a); break;
-    case 4: launch_ex(mix_kernel<NS, 4>, dim3(M), MIX_T, 0, 1, pdl, stream, a); break;
+    case 1: launch_mix<NS, 1>(M, a, pdl, stream); break;
+    case 2: launch_mix<NS, 2>(M, a, pdl, stream); break;
+    case 3: launch_mix<NS, 3>(M, a, pdl, stream); break;
+    case 4: launch_mix<NS, 4>(M, a, pdl, stream); break;
   }
 }
 
@@ -458,6 +487,8 @@ void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t s
   const MixArgs a = mix_args(p), b = mix_args(msg);
   require(msg.nblocks == 1 && msg.Q == 4, "mix_pair: the message mix takes one block and four queries");
   require(p.M == msg.M, "mix_pair: both mixes take the same tokens");
+  require(!a.copies[0].dst && !a.copies[1].dst && !b.copies[0].dst && !b.copies[1].dst,
+          "mix_pair: row copies go with mix");
   switch (p.nblocks + 1) {
     case 2: launch_pair_q<2>(p.Q, p.M, a, b, pdl, stream); break;
     case 3: launch_pair_q<3>(p.Q, p.M, a, b, pdl, stream); break;
