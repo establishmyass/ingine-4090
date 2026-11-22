@@ -619,14 +619,25 @@ void moe_route(const int* idx, int T, const MoeWork& w, cudaStream_t stream) {
   route_kernel<<<1, 1024, 0, stream>>>(idx, T, w);
 }
 
+#ifdef INGINE_ADA_SMALL_MOE
+// At 265 prompt tokens the larger tile wins on SM89. Offloaded experts use their per-expert pointer table.
+constexpr int kSmallMoeMaxTokens = 128;
+#endif
+
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream) {
+#ifdef INGINE_ADA_SMALL_MOE
+  if (T <= kSmallMoeMaxTokens && !e.table) return moe_small_gate_up(e, x, T, w, act, stream);
+#endif
   if (e.fmt == 0) launch_gemm<0, true>(e.w13, e.w13_scale, e.w13_factor, x, T, w, act, stream, e.table);
   else launch_gemm<1, true>(e.w13, e.w13_scale, nullptr, x, T, w, act, stream, e.table);
 }
 
 void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
               cudaStream_t stream) {
+#ifdef INGINE_ADA_SMALL_MOE
+  if (T <= kSmallMoeMaxTokens && !e.table) return moe_small_down(e, act, T, w, down, stream);
+#endif
   if (e.fmt == 0) launch_gemm<0, false>(e.w2, e.w2_scale, e.w2_factor, act, T, w, down, stream, e.table);
   else launch_gemm<1, false>(e.w2, e.w2_scale, nullptr, act, T, w, down, stream, e.table);
 }

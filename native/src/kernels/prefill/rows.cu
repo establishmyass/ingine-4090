@@ -5,6 +5,7 @@
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -143,12 +144,11 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
   }
 }
 
-// ---- rel_logits: 1024 distances x 4 per thread, rel_proj columns in registers, 16 tokens per CTA
-
-constexpr int REL_TOKENS = 16;
+// ---- rel_logits: 1024 distances x 4 per thread, rel_proj columns in registers; a CTA covers 8 heads of `tpb`
+// consecutive tokens (grid: token groups x 3 head groups, enough CTAs for small chunks)
 
 __global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restrict__ rel,
-                                                         const float* __restrict__ rel_proj, int T,
+                                                         const float* __restrict__ rel_proj, int T, int tpb,
                                                          uint16_t* __restrict__ out) {
   const int d = threadIdx.x * 4;
   float rp[kRel][4];
@@ -157,9 +157,9 @@ __global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restr
     const float4 v = *reinterpret_cast<const float4*>(rel_proj + j * kRelExtent + d);
     rp[j][0] = round_bf16(v.x), rp[j][1] = round_bf16(v.y), rp[j][2] = round_bf16(v.z), rp[j][3] = round_bf16(v.w);
   }
-  const int t1 = min(T, (blockIdx.x + 1) * REL_TOKENS);
-  for (int t = blockIdx.x * REL_TOKENS; t < t1; ++t) {
-    for (int h = 0; h < kHeads; ++h) {
+  const int t1 = min(T, (blockIdx.x + 1) * tpb);
+  for (int t = blockIdx.x * tpb; t < t1; ++t) {
+    for (int h = blockIdx.y * 8; h < blockIdx.y * 8 + 8; ++h) {
       const uint16_t* r = rel + (size_t(t) * kHeads + h) * kRel;
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -338,8 +338,9 @@ void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
 }
 
 void rel_logits(const __nv_bfloat16* rel, const float* rel_proj, int T, __nv_bfloat16* out, cudaStream_t stream) {
-  rel_logits_kernel<<<(T + REL_TOKENS - 1) / REL_TOKENS, 256, 0, stream>>>(
-      reinterpret_cast<const uint16_t*>(rel), rel_proj, T, reinterpret_cast<uint16_t*>(out));
+  const int tpb = std::min(16, std::max(1, T / 128));
+  rel_logits_kernel<<<dim3((T + tpb - 1) / tpb, kHeads / 8), 256, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(rel), rel_proj, T, tpb, reinterpret_cast<uint16_t*>(out));
 }
 
 void static_conv(const __nv_bfloat16* x, int ld, int T, int C, const float* w, const float* state, float* out,

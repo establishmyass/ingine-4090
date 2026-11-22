@@ -226,6 +226,9 @@ int main() {
   ok &= run(rng, 0, 200);
   ok &= run(rng, 1, 200);
   ok &= run(rng, 0, 9);
+  // Small Ada tiles split a heavily routed expert across several 32-row blocks.
+  ok &= run(rng, 0, 128);
+  ok &= run(rng, 1, 128);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

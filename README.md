@@ -25,15 +25,18 @@ The binary and verified weights are already present in this checkout. `INGINE_AB
 
 ## Measurements
 
-One RTX 4090, Ryzen 9 7950X3D and CUDA 13.5. The server was ready before timing each request. The long documents carried fresh inventory records and three passcodes placed at 2%, 50% and 96% depth. The client measured first output including reasoning and counted completion tokens after the first for decode.
+Measured on one RTX 4090, a Ryzen 9 7950X3D and CUDA 13.5. Each server was already loaded. Time to first token includes reasoning. Cold documents contained three passcodes placed at 2%, 50% and 96% depth. The supplied ablation was active.
 
-| Uncached input tokens | Time to first token | Decode at that depth | Output tokens |
-|---:|---:|---:|---:|
-| 32,993 | 3.24 s | 265.7 tok/s | 163 |
-| 245,215 | 34.14 s | 230.5 tok/s | 204 |
-| 261,583 | 37.46 s | 225.1 tok/s | 470 |
+| Workload | Initial 4090 port (`172c767`) | This build |
+|---|---:|---:|
+| Short chat, median first token across nine requests | 57.3 ms | 45.4 ms |
+| 33,018-token cold prompt, first token | 3.25 s | 3.23 s |
+| 251,504-token cold prompt, first token | 35.40 s | 35.31 s |
+| Decode after that prompt, same 249-token output | 224.5 tok/s | 228.8 tok/s |
+| Same chat, 25-token follow-up, first token | 150 ms | 141 ms |
+| Fixed-output replay, 2,914 timed tokens over eight workloads | 266.8 tok/s | 270.8 tok/s |
 
-All three codes were recovered on both long requests. Two image requests returned the colors in the correct order, and a separate request returned a structured weather tool call. Each timing is one request; DSpark acceptance depends on the text. The median of three short, 128-output-token coding requests was 272.9 tok/s. A 3,072-token prefill chunk gave nearly the same 245K first-token time while leaving roughly 380 MiB less headroom. Moving 4 GiB of experts to host memory increased the 32,993-token first-token time from about 3.2 to 6.6 seconds on this machine.
+The near-limit test recovered all three codes from 261,145 fresh tokens. It reached first output in 37.24 s and decoded at 220.3 tok/s. Baseline figures average two runs, and the updated column is one final run. Speculative acceptance varies with the text. After startup, the card reported 1,069 MiB free. Both original and ablated launchers answered a sampled chat request. The ablated launcher also passed the image and tool checks.
 
 ## Rebuild
 
@@ -48,10 +51,12 @@ python3 scripts/download_model.py --verify-only
 ./scripts/ingine serve
 ```
 
-`bash setup.sh` opens the installer menu for building with a private CUDA toolkit or downloading the pinned weights into a fresh checkout. For the native tests, stop the server first, then run `ctest --test-dir native/build-sm89 --output-on-failure -E bench`. The optional trace test uses external chat fixtures. The current upstream speculative fidelity gate passed: three of 12,000 emitted tokens differed from the width-one argmax by more than 0.5 logits (2.5 per 10,000; upstream limit 15).
+`bash setup.sh` opens the installer menu for building with a private CUDA toolkit or downloading the pinned weights into a fresh checkout. For the native tests, stop the server first, then run `ctest --test-dir native/build-sm89 --output-on-failure -E bench`. The optional trace test uses external chat fixtures. The updated build passed the upstream speculative fidelity gate. Nine of 12,000 emitted tokens exceeded a 0.5-logit gap from width-one greedy decoding, compared with three on the initial 4090 port. The upstream limit is 15 per 10,000.
 
 ## Port lineage
 
 Based on [skyne98’s RTX 3090 adaptation](https://github.com/skyne98/inkling-ingine-3090/tree/616ee271282dd84417e1b38dea69825c4fe341d5) of [satellitedown’s RTX 5090 engine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine). This branch uses the 3090 adaptation’s cluster-free kernels, prompt checkpoints and CPU vision implementation. Ada uses hardware E4M3-to-FP16 conversion and the portable E2M1 path. Its eight KV heads use 32 decode splits for one row and 16 for verification, sized for the 4090’s 128 SMs. At 131,064 tokens the eight-row full-attention kernel took 316 µs, down from 493 µs with the 3090 split.
 
 The upstream model and license notices are in [NOTICE](NOTICE). The [3090 port notes](PORT-3090.md), [expert offload guide](EXPERT-OFFLOAD.md) and [image guide](IMAGE-INPUT.md) document the shared implementation.
+
+This port also incorporates satellitedown's tensor-core DSpark attention, FP8 draft projections and global draft KV ring, adapted to the 3090 branch's host checkpoint layout. On SM89, resident expert batches up to 128 prompt tokens use a 32-row tile derived from the upstream grouped expert GEMM. Full chunks use the 3090 branch's warp-specialized kernel. [Upstream DSpark implementation](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/57b2dc74777205718e76fe121beeb9433898251c) · [Upstream prefill implementation](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/58377f443e0b987c3057cce3b0671557ddd0c324)

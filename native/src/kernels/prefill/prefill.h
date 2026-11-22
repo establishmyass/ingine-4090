@@ -155,6 +155,12 @@ struct MoeExperts {
   // pointers above are then unused
   const kernels::moe::ExpertTable* table = nullptr;
 };
+#ifdef INGINE_ADA_SMALL_MOE
+void moe_small_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
+                       cudaStream_t stream);
+void moe_small_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
+                    cudaStream_t stream);
+#endif
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
