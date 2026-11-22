@@ -9,7 +9,7 @@
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CUDA_ARCHITECTURES": "120a",
+        "CMAKE_CUDA_ARCHITECTURES": "89",
         "INGINE_BUILD_APPS": "ON",
         "INGINE_BUILD_TESTS": "OFF"
       }

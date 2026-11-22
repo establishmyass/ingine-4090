@@ -1,6 +1,7 @@
 // Exact E4M3 (FP8) and E2M1 (FP4) -> FP16 decoding for every build target.
 //
 // RTX 5090 builds (sm_120a) use the hardware conversions (cvt.rn.f16x2.e4m3x2 / .e2m1x2), unchanged.
+// Ada (sm_89) has the native E4M3 conversion and uses the portable E2M1 path.
 // The RTX 3090 port (sm_86, INGINE_AMPERE) has neither instruction, and cuda_fp8.h's fallback below sm_89
 // decodes one byte at a time with a normalisation loop for subnormals. Here instead each code is moved
 // into the top of an FP16 field with a byte permute and two masks:
@@ -21,7 +22,7 @@ namespace ingine::kernels::fp {
 
 // Two E4M3 codes (low 16 bits of v, element 0 in the low byte) -> f16x2 (element 0 in the low half).
 __device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint32_t v) {
-#ifndef INGINE_AMPERE
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
   uint32_t r;
   asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<uint16_t>(v)));
   return r;

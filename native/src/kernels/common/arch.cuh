@@ -1,5 +1,5 @@
-// Target switches shared by host and device code. INGINE_AMPERE (CMake, CMAKE_CUDA_ARCHITECTURES=86) is the
-// RTX 3090 port: no programmatic dependent launch (PDL), no thread-block clusters.
+// Target switches shared by host and device code. INGINE_AMPERE selects the SM8x path on RTX 3090 and RTX 4090:
+// no programmatic dependent launch (PDL) or thread-block clusters.
 //
 // Without PDL every kernel of a stream starts after its predecessor completed, so griddepcontrol.wait /
 // launch_dependents become no-ops (the wait keeps a compiler memory barrier, so program order around it is

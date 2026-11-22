@@ -53,9 +53,8 @@ TOOLS="$ROOT/.tools/venv"
 CUDA_HOME="$ROOT/.cuda-toolkit/nvidia/cu13"
 BUILD="$ROOT/native/build-install"  # the "install" preset in native/CMakePresets.json
 SERVER="$BUILD/apps/serve/ingine-serve"
-PROFILE="$BUILD/profile.env"
 MIN_DRIVER=580
-MIN_GPU_MIB=31744
+MIN_GPU_MIB=23000
 CONFIG="$HOME/.config/ingine/env"
 
 confirm() {
@@ -80,7 +79,7 @@ existing_parent() {
 
 # ---- checks before any change ----------------------------------------------------------------------
 
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || fail 'ingine requires Linux x86_64 with an NVIDIA RTX 5090.'
+[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || fail 'ingine requires Linux x86_64 with an NVIDIA RTX 4090.'
 for command in git curl; do
   command -v "$command" >/dev/null || fail "Missing $command. Install it, or run bash setup.sh and choose 1."
 done
@@ -98,8 +97,8 @@ if [[ "$MODE" != download ]]; then
   driver_major="${driver%%.*}"
   [[ "$driver_major" =~ ^[0-9]+$ ]] || fail "Cannot read the NVIDIA driver version from nvidia-smi ($driver)."
   (( driver_major >= MIN_DRIVER )) || fail "NVIDIA driver $driver is too old: ingine is built with CUDA 13, which needs driver $MIN_DRIVER or newer. Update the driver, then rerun."
-  if ! awk -F', ' -v min="$MIN_GPU_MIB" '$3 == "12.0" && $4 + 0 >= min {found = 1} END {exit !found}' <<< "$gpus"; then
-    confirm 'ingine targets a 32 GB RTX 5090 (compute capability 12.0, sm_120a); its kernels do not run on other GPUs, and the served 262,144-token context needs about 31 GiB of GPU memory.'
+  if ! awk -F', ' -v min="$MIN_GPU_MIB" '$3 == "8.9" && $4 + 0 >= min {found = 1} END {exit !found}' <<< "$gpus"; then
+    confirm 'This build targets a 24 GB RTX 4090 (compute capability 8.9, sm_89). Choose a compatible GPU for the full-context profile.'
   fi
 fi
 
@@ -283,7 +282,7 @@ else
   NVCC_HOST=""
   for candidate in "${candidates[@]}"; do
     path="$(command -v "$candidate")" || continue
-    if "$CUDA_HOME/bin/nvcc" -ccbin "$path" -std=c++20 -gencode=arch=compute_120a,code=sm_120a \
+    if "$CUDA_HOME/bin/nvcc" -ccbin "$path" -std=c++20 -gencode=arch=compute_89,code=sm_89 \
       -c "$probe/probe.cu" -o "$probe/probe.o" >/dev/null 2>&1; then
       NVCC_HOST="$path"
       break
@@ -312,37 +311,13 @@ else
   printf '\nBuilding the C++ engine (ingine-serve, %d parallel jobs) into native/build-install/; the first build takes a few minutes...\n' "$jobs"
   if ! (cd "$ROOT/native" && "$TOOLS/bin/cmake" --preset install --log-level=WARNING \
     -DCMAKE_MAKE_PROGRAM="$TOOLS/bin/ninja" -DCMAKE_C_COMPILER="$CC_PATH" -DCMAKE_CXX_COMPILER="$CXX_PATH" \
-    -DCMAKE_CUDA_HOST_COMPILER="$NVCC_HOST" >/dev/null); then
+    -DCMAKE_CUDA_HOST_COMPILER="$NVCC_HOST" -DPython3_EXECUTABLE="$PYTHON" >/dev/null); then
     fail 'Configuring the C++ build failed; see the error above. If native/build-install was configured in another folder or with other compilers, move it aside and rerun; it was not deleted.'
   fi
   (cd "$ROOT/native" && "$TOOLS/bin/cmake" --build --preset install --target ingine-serve --parallel "$jobs") \
     || fail 'Building the C++ engine failed; see the error above. Rerun to retry; finished parts are kept.'
   "$SERVER" --help >/dev/null || fail "The built server does not run ($SERVER); see the error above."
 
-  # scripts/ingine reads the serving profile from here, so serving needs no JSON parser.
-  "$PYTHON" - "$ROOT/runtime-manifest.json" > "$PROFILE.tmp" <<'PY'
-import json
-import shlex
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    manifest = json.load(stream)
-serving, model = manifest["serving"], manifest["model"]
-flags = ["--" + key.replace("_", "-") for key in ("dense_fp8", "kv_fp8", "spec") if serving[key]]
-if serving["spec"]:
-    flags += ["--spec-threshold", str(serving["spec_threshold"])]
-# Files the server reads; the ablation file is checked on its own because INGINE_ABLATION may replace it.
-skip = {"README.md", "LICENSE", "NOTICE", "SHA256SUMS", ".gitattributes", manifest["ablation"]}
-required = [name for name in dict.fromkeys(["config.json", *model["files"]]) if name not in skip]
-print("# Written by scripts/install.sh from runtime-manifest.json; sourced by scripts/ingine.")
-for name, value in (("host", serving["host"]), ("port", serving["port"]), ("max_ctx", serving["max_ctx"]),
-                    ("model_id", serving["model_id"]), ("ablation", manifest["ablation"]),
-                    ("directory", model["directory"])):
-    print(f"profile_{name}={shlex.quote(str(value))}")
-print("profile_flags=(" + " ".join(map(shlex.quote, flags)) + ")")
-print("profile_required=(" + " ".join(map(shlex.quote, required)) + ")")
-PY
-  mv -f -- "$PROFILE.tmp" "$PROFILE"
   echo 'The C++ engine is built.'
 fi
 

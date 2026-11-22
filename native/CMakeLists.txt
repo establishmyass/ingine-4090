@@ -1,14 +1,13 @@
 # Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 cmake_minimum_required(VERSION 3.28)
 
-# ingine is compiled only for sm_120a (RTX 5090 class). Set and validate the architecture before
-# CUDA compiler detection.
+# Select a single target before CUDA compiler detection. This fork defaults to the RTX 4090.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|86)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|89|86)$")
   message(FATAL_ERROR
-    "ingine supports only CMAKE_CUDA_ARCHITECTURES=120a (RTX 5090) or 86 (RTX 3090 port); got "
+    "ingine supports only CMAKE_CUDA_ARCHITECTURES=120a (RTX 5090), 89 (RTX 4090), or 86 (RTX 3090); got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
@@ -45,9 +44,8 @@ endif()
 
 include(cmake/Dependencies.cmake)
 
-# RTX 3090 port: sm_86 has no programmatic dependent launch, thread-block clusters / distributed shared
-# memory or hardware FP8 / FP4 conversions; INGINE_AMPERE selects the replacements (host and device code).
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
+# Both SM8x targets use stream ordering and the cluster-free kernels. Ada has native FP8 conversion.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   add_compile_definitions(INGINE_AMPERE=1)
 endif()
 
@@ -88,6 +86,16 @@ ingine_add_component(src/engine)
 ingine_add_component(src/serve)
 
 if(INGINE_BUILD_APPS)
+  # The shell launcher can use a source build as well as the private-toolkit installation.
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    set(_manifest "${PROJECT_SOURCE_DIR}/../runtime-manifest.json")
+    set(_profile_writer "${PROJECT_SOURCE_DIR}/../scripts/write_profile.py")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_manifest}" "${_profile_writer}")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${_profile_writer}" "${_manifest}"
+                    OUTPUT_FILE "${PROJECT_BINARY_DIR}/profile.env.tmp" COMMAND_ERROR_IS_FATAL ANY)
+    file(RENAME "${PROJECT_BINARY_DIR}/profile.env.tmp" "${PROJECT_BINARY_DIR}/profile.env")
+  endif()
   foreach(app serve bench validate)
     ingine_add_component(apps/${app})
   endforeach()

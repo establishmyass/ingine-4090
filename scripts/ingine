@@ -4,10 +4,16 @@ set -euo pipefail
 
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 ROOT="$(cd -- "$(dirname -- "$SELF")/.." && pwd -P)"
-UNIT=inkling-ingine
+UNIT=inkling-ingine-4090
 CONFIG="$HOME/.config/ingine/env"
 RUN="$ROOT/.run"
-BUILD="$ROOT/native/build-install"  # built by scripts/install.sh
+BUILD="$ROOT/native/build-install"
+for candidate in "$BUILD" "$ROOT/native/build-sm89" "$ROOT/native/build"; do
+  if [[ -x "$candidate/apps/serve/ingine-serve" && -r "$candidate/profile.env" ]]; then
+    BUILD=$candidate
+    break
+  fi
+done
 SERVER="$BUILD/apps/serve/ingine-serve"
 PROFILE="$BUILD/profile.env"
 NOTIFY=0

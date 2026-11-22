@@ -17,6 +17,9 @@
 // tokens with the width-1 graph. Every emitted token must be the plain argmax, or lose to it by at most
 // --tie-margin logits (speculative verification runs wider kernels whose rounding differs, so near ties may
 // resolve differently); without --spec the generator runs the same width-1 kernels and must match exactly.
+// With --max-gap-rate R the margin is a rate instead: over all selected cases, at most R tokens per 10,000 may
+// lose to the plain argmax by more than --tie-margin (single positions of this model can move by several
+// logits between kernel widths, so one long path is not evidence either way). Prints the gap distribution.
 // N > 1024 covers the sliding-window ring wrap and the drafter's context buckets.
 #include "ingine/generator.h"
 
@@ -58,6 +61,7 @@ struct Args {
   bool spec = false;  // --generate / --path with DSpark speculative decoding
   int path_tokens = 0;        // --path N
   double tie_margin = 0.5;    // --tie-margin X
+  double max_gap_rate = -1;   // --max-gap-rate R: tokens per 10,000 above the margin (off: per-case maximum)
   double max_kl = 0.25;
   double max_mean_kl = 0.01;
   double min_top1 = 0.95;
@@ -66,7 +70,8 @@ struct Args {
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
-      "                       [--path N [--spec] [--tie-margin X]] [--max-kl X] [--max-mean-kl X] [--min-top1 F]\n"
+      "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
+      "                       [--min-top1 F]\n"
       "--cases takes comma-separated name substrings\n");
 }
 
@@ -190,8 +195,15 @@ void run_generate(const RuntimeOptions& opt, const std::vector<nlohmann::json>& 
   }
 }
 
+// gap distribution of --path over all cases: emitted tokens that are not the plain argmax, by logit gap
+constexpr double kGapEdges[5] = {0.1, 0.25, 0.5, 1.0, 2.0};
+struct Gaps {
+  std::size_t tokens = 0, other = 0, over[5] = {}, over_margin = 0;
+  double max = 0;
+};
+
 // --path: see the file header. One stage per case; `top1` is the case's verdict.
-void run_path(RuntimeOptions opt, const std::vector<nlohmann::json>& cases, const Args& a, Totals& tot) {
+void run_path(RuntimeOptions opt, const std::vector<nlohmann::json>& cases, const Args& a, Totals& tot, Gaps& gaps) {
   const int N = a.path_tokens;
   std::size_t longest = 0;
   for (const auto& c : cases) longest = std::max(longest, c.at("prompt_ids").size());
@@ -241,10 +253,17 @@ void run_path(RuntimeOptions opt, const std::vector<nlohmann::json>& cases, cons
       if (best == out[k]) continue;
       ++other;
       if (first < 0) first = int(k);
-      worst = std::max(worst, double(host[best]) - double(host[out[k]]));
+      const double gap = double(host[best]) - double(host[out[k]]);
+      worst = std::max(worst, gap);
+      for (int e = 0; e < 5; ++e) gaps.over[e] += gap > kGapEdges[e];
+      gaps.over_margin += gap > a.tie_margin;
     }
+    gaps.tokens += out.size();
+    gaps.other += std::size_t(other);
+    gaps.max = std::max(gaps.max, worst);
     Stage s;
-    s.top1 = int(out.size()) == N && worst <= (a.spec ? a.tie_margin : 0.0) && other <= (a.spec ? N / 20 : 0);
+    const bool margin_ok = a.max_gap_rate >= 0 || worst <= (a.spec ? a.tie_margin : 0.0);
+    s.top1 = int(out.size()) == N && margin_ok && other <= (a.spec ? N / 20 : 0);
     s.max_diff = worst;
     tot.add(s);
     std::printf("%-22s path: %zu tokens, %d not the plain argmax (first at %d), largest gap %.4f logits  %s\n",
@@ -273,6 +292,7 @@ int main(int argc, char** argv) {
     else if (k == "--spec") a.spec = true;
     else if (k == "--path") a.path_tokens = std::stoi(val());
     else if (k == "--tie-margin") a.tie_margin = std::stod(val());
+    else if (k == "--max-gap-rate") a.max_gap_rate = std::stod(val());
     else if (k == "--max-kl") a.max_kl = std::stod(val());
     else if (k == "--max-mean-kl") a.max_mean_kl = std::stod(val());
     else if (k == "--min-top1") a.min_top1 = std::stod(val());
@@ -304,6 +324,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     Totals tot;
+    Gaps gaps;
     for (const auto& [key, cases] : groups) {
       RuntimeOptions opt;
       opt.model_dir = a.model_dir;
@@ -315,15 +336,27 @@ int main(int argc, char** argv) {
       opt.spec = a.generate && a.spec;
       std::printf("== %s model, %s full-attention KV\n", key.first ? "abliterated" : "original",
                   key.second ? "FP8" : "BF16");
-      if (a.path_tokens > 0) run_path(opt, cases, a, tot);
+      if (a.path_tokens > 0) run_path(opt, cases, a, tot, gaps);
       else if (a.generate) run_generate(opt, cases, tot);
       else run_pieces(opt, cases, tot);
     }
     const double top1 = tot.stages ? double(tot.top1) / tot.stages : 0.0;
     const double mean_kl = tot.stages ? tot.sum_kl / tot.stages : 0.0;
     const bool no_kl = a.generate || a.path_tokens > 0;
-    const bool ok = (no_kl || (tot.max_kl <= a.max_kl && mean_kl <= a.max_mean_kl)) &&
-                    top1 >= (a.path_tokens > 0 ? 1.0 : a.min_top1);
+    bool ok = (no_kl || (tot.max_kl <= a.max_kl && mean_kl <= a.max_mean_kl)) &&
+              top1 >= (a.path_tokens > 0 ? 1.0 : a.min_top1);
+    if (a.path_tokens > 0) {
+      const double rate = gaps.tokens ? 1e4 * double(gaps.over_margin) / double(gaps.tokens) : 0.0;
+      std::printf("gaps: %zu tokens, %zu not the plain argmax; above 0.1 / 0.25 / 0.5 / 1 / 2 logits: %zu / %zu / %zu / "
+                  "%zu / %zu; max %.4f; above the %.2f margin: %.2f per 10,000",
+                  gaps.tokens, gaps.other, gaps.over[0], gaps.over[1], gaps.over[2], gaps.over[3], gaps.over[4],
+                  gaps.max, a.tie_margin, rate);
+      if (a.max_gap_rate >= 0) {
+        ok &= rate <= a.max_gap_rate;
+        std::printf(" (limit %.2f)", a.max_gap_rate);
+      }
+      std::printf("\n");
+    }
     std::printf("%s: %d stages, top1 %.3f, KL mean %.3e max %.3e (limits: KL mean %.3e max %.3e, top1 %.3f)\n",
                 ok ? "PASS" : "FAIL", tot.stages, top1, mean_kl, tot.max_kl, a.max_mean_kl, a.max_kl, a.min_top1);
     return ok ? 0 : 1;

@@ -4,6 +4,7 @@
 #include "common/test_util.h"
 #include "ingine/generator.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <numeric>
@@ -66,7 +67,10 @@ int main() {
     std::printf("greedy: %d rounds, %d accepted; forced: %d rounds, %d accepted, %zu traced\n", ref.spec_rounds,
                 ref.spec_accepted, st.spec_rounds, st.spec_accepted, st.spec_trace.size());
     expect(out == greedy_out, "speculative forced replay emits the forced output");
-    expect(st.spec_rounds == ref.spec_rounds && st.spec_accepted == ref.spec_accepted,
+    // The greedy run's last round may accept drafts past the token budget (1 + rounds + accepted tokens were
+    // produced, the first `tokens` emitted); the replay has no forced tokens there to accept.
+    const int past_budget = std::max(0, ref.spec_rounds + ref.spec_accepted - tokens);
+    expect(st.spec_rounds == ref.spec_rounds && st.spec_accepted == ref.spec_accepted - past_budget,
            "forced replay of the greedy output repeats its rounds");
     int traced = 0;
     for (const auto& r : st.spec_trace) traced += r.accepted;
