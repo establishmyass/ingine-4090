@@ -5,7 +5,7 @@ This Linux port serves Inkling 2 Mini through a native C++/CUDA engine built for
 ## Install and run
 
 ```bash
-git clone https://github.com/establishmyass/ingine-4090.git
+git clone --branch perf/4090-latency https://github.com/establishmyass/ingine-4090.git
 cd ingine-4090
 bash setup.sh
 ```
@@ -21,16 +21,25 @@ Use an **OpenAI-compatible** client with base URL `http://127.0.0.1:8080/v1` and
 | Dense weights / full-attention KV | FP8 / FP8 |
 | Routed experts | Original mixed NVFP4 / MXFP8, resident on GPU |
 | Speculation | Native DSpark, confidence threshold 0.8 |
-| Prefill chunk | 2,048 tokens |
+| Prefill chunk | 4,096 tokens |
+| Displaced conversations | Up to 9,216 MiB of pinned system RAM, allocated on demand |
 | Images | CPU vision tower, AVX-512 BF16 capable CPU |
 
 The original model is served as `inkling-2-mini`. `PORT`, `HOST`, `INGINE_MODEL_DIR` and `INGINE_CTX` override the local settings. Stop other model servers before using the full window. For example, `INGINE_CTX=65536 ./scripts/ingine serve` frees memory on a busier desktop. On CPUs supporting the expert offload path, `./scripts/ingine serve --offload-experts 4` is a lower-VRAM option.
 
-## Measurements
+## Performance branch
+
+The 4090 profile shares prefill workspace between operations that run at different times and uses larger chunks. For full-attention KV, verification reads two FP8 tiles ahead of the value computation. The dense gates reuse their inputs across verified tokens.
+
+When another chat displaces a prompt of at least 2,048 tokens, the server can save its full-attention KV and checkpoint in system RAM. Returning to a matching token and image prefix restores it. The first switch pays for allocating pinned memory and transferring the prefix. The server can reuse that allocation on subsequent switches. Set the budget with `./scripts/ingine serve --park-host-mib 4096`, or use `--park-host-mib 0` to disable conversation parking. The server log reports `reuse=parked` and the number of tokens restored. To recover desktop VRAM, use `--prefill-chunk 2048`.
+
+The verification kernels and full-row checkpoint copies are adapted from satellitedown's original engine. [Narrow verification](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/ac5f704e176b387ea8c1d377b332887a2344e722) · [FP8 attention](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/866e908c9f0eaefb238ddcd205349ac026a77bed) · [Conversation parking](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/8210872574b9607f59639da49bb483faf5b37523)
+
+## Published baseline measurements
 
 Measured on one RTX 4090, a Ryzen 9 7950X3D and CUDA 13.5. Each server was already loaded. Time to first token includes reasoning. Cold documents contained three passcodes placed at 2%, 50% and 96% depth. The supplied ablation was active.
 
-| Workload | Initial 4090 port (`172c767`) | This build |
+| Workload | Initial 4090 port (`172c767`) | Published `rtx4090` baseline |
 |---|---:|---:|
 | Short chat, median first token across nine requests | 57.3 ms | 45.4 ms |
 | 33,018-token cold prompt, first token | 3.25 s | 3.23 s |
@@ -54,7 +63,7 @@ python3 scripts/download_model.py --verify-only
 ./scripts/ingine serve
 ```
 
-`bash setup.sh` opens the installer menu for building with a private CUDA toolkit or downloading the pinned weights into a fresh checkout. For the native tests, stop the server first, then run `ctest --test-dir native/build-sm89 --output-on-failure -E bench`. The optional trace test uses external chat fixtures. The updated build passed the upstream speculative fidelity gate. Nine of 12,000 emitted tokens exceeded a 0.5-logit gap from width-one greedy decoding, compared with three on the initial 4090 port. The upstream limit is 15 per 10,000.
+`bash setup.sh` opens the installer menu for building with a private CUDA toolkit or downloading the pinned weights into a fresh checkout. For the native tests, stop the server first, then run `ctest --test-dir native/build-sm89 --output-on-failure -E bench`. The optional trace test uses external chat fixtures. The published baseline recorded nine of 12,000 emitted tokens more than 0.5 logits below the width-one greedy argmax. The upstream gate allows 15 per 10,000.
 
 ## Port lineage
 
