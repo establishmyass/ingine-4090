@@ -6,6 +6,8 @@
 #include "kernels/draft/rng.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -15,6 +17,17 @@ namespace ingine::kernels::draft {
 
 __device__ __forceinline__ float bf_round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 __device__ __forceinline__ float bf(const __nv_bfloat16& x) { return __bfloat162float(x); }
+
+// One element of a key/value cache: BF16, or E4M3 without a scale (nearest even, saturating at +-448).
+__device__ __forceinline__ void store_cache(void* cache, size_t at, float x, bool fp8) {
+  if (fp8) static_cast<__nv_fp8_storage_t*>(cache)[at] = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+  else static_cast<__nv_bfloat16*>(cache)[at] = __float2bfloat16_rn(x);
+}
+// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a (cuda_fp8.hpp)
+__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
+  const __nv_bfloat162_raw b = __nv_cvt_fp8x2_to_bf162raw(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
+  return uint32_t(b.x) | (uint32_t(b.y) << 16);
+}
 
 // 8 BF16 values (one uint4) -> 8 floats.
 __device__ __forceinline__ void unpack8(const uint4& v, float* f) {
@@ -64,9 +77,6 @@ __device__ __forceinline__ float block_max(float v, float* scratch) {
 __device__ __forceinline__ uint32_t float_key(float f) {
   const uint32_t u = __float_as_uint(f);
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-__device__ __forceinline__ float key_float(uint32_t k) {
-  return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
 }
 
 // (score, index) packed so that atomicMax / max picks the largest score and, among equal scores, the

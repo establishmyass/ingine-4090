@@ -3,6 +3,10 @@
 // the per-row-count graphs equal eager commits, the outputs are well formed (tokens are each row's first
 // maximum, -inf outside 1024 candidates, conf = 1 / sum exp(l - max)), sampled drafts are reproducible per
 // seed, and the shortlist head proposes only its ranked tokens and the noted context tokens.
+//
+// INGINE_BENCH=1 runs a timing instead (about 4 GB of GPU memory): the round transition (Drafter::advance:
+// small commit + draft) at the full vocabulary with random weights for the target's embedding and
+// unembedding, at context lengths 2K / 20K / 70K, with the L2 flushed between rounds as a verify call does.
 #include "common/test_util.h"
 #include "kernels/dense/dense.h"
 #include "kernels/draft/shortlist.h"
@@ -11,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <vector>
 
@@ -72,6 +77,108 @@ bool well_formed(const DraftOut& o, bool greedy) {
   return ok;
 }
 
+// Timing of the round transition at production sizes (see the file comment).
+int bench(const std::filesystem::path& dir, cudaStream_t stream) {
+  constexpr int BV = model::UNPADDED_VOCAB, BCTX = 262144, CHUNK = 1024, ROUNDS = 300;
+  // BF16 normals from a table (a full-vocabulary matrix has 461M entries)
+  std::vector<__nv_bfloat16> table(65536);
+  Rng r(11);
+  for (auto& x : table) x = float_to_bf16(float(r.normal()));
+  std::uint64_t lcg = 0x243F6A8885A308D3ull;
+  auto fill = [&](std::vector<__nv_bfloat16>& v) {
+    for (auto& x : v) {
+      lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+      x = table[lcg >> 48];
+    }
+  };
+  model::Weights w;
+  w.storage.reserve(4);
+  {
+    std::vector<__nv_bfloat16> host(std::size_t(BV) * H);
+    fill(host);
+    auto& e = w.storage.emplace_back(host.size() * 2);
+    e.copy_from_host(host.data(), host.size() * 2);
+    std::vector<float> en(H, 1.f);
+    auto& n = w.storage.emplace_back(en.size() * 4);
+    n.copy_from_host(en.data(), en.size() * 4);
+    fill(host);
+    DeviceBuffer u16(host.size() * 2);
+    u16.copy_from_host(host.data(), host.size() * 2);
+    auto& q = w.storage.emplace_back(host.size());
+    auto& sc = w.storage.emplace_back(std::size_t(BV) * 4);
+    ingine::kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(u16.p), BV, H, q.p, static_cast<float*>(sc.p),
+                                     nullptr);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    w.embed = model::rm(w.storage[0].p, DType::BF16, {BV, H});
+    w.embed_norm = model::rm(w.storage[1].p, DType::FP32, {H});
+    w.unembed.w = model::rm(w.storage[2].p, DType::FP8_E4M3FN, {BV, H});
+    w.unembed.scale = model::rm(w.storage[3].p, DType::FP32, {BV});
+    w.dense_fp8 = true;
+  }
+  std::vector<__nv_bfloat16> feats(std::size_t(CHUNK) * 4 * H);
+  fill(feats);
+  DeviceArray<__nv_bfloat16> d_feats(feats);
+  const std::size_t flush_bytes = std::size_t(256) << 20;  // more than the L2
+  DeviceArray<uint8_t> junk(flush_bytes);
+  DeviceArray<int32_t> d_m(std::vector<int32_t>{8}), d_acc(std::vector<int32_t>{2}), d_next(std::vector<int32_t>{99});
+
+  model::Drafter d(dir, w, BCTX, stream);
+  d.capture();
+  ingine::kernels::draft::RoundInputs in;
+  in.nwidths = 1;
+  in.widths[0] = 8;
+  in.taps[0] = d_feats.get();
+  in.m = d_m.get();
+  in.accepted = d_acc.get();
+  in.next_greedy = d_next.get();
+  in.next_sampled = d_next.get();
+  d.bind_round(in);
+  // context tokens beyond the shortlist, as a long prompt adds (the first 4000 ids outside it)
+  {
+    std::vector<std::uint8_t> ranked(BV, 0);
+    int taken = 0;
+    for (const std::uint32_t t : ingine::kernels::draft::draft_shortlist_ranks())
+      if (taken < model::Drafter::SHORTLIST_ROWS && t < std::uint32_t(BV) && !ranked[t]) ranked[t] = 1, ++taken;
+    std::vector<std::int32_t> extra;
+    for (int t = 0; t < BV && extra.size() < 4000; ++t)
+      if (!ranked[t]) extra.push_back(t);
+    d.note_tokens(extra);
+  }
+  int len = 0;
+  for (const int target : {2000, 20000, 70000}) {
+    for (; len < target; len += CHUNK) d.commit(d_feats.get(), std::min(CHUNK, target - len), len);
+    len = target;
+    for (const float T : {0.f, 1.f}) {
+      int P = len;
+      d.draft(17, P, T);
+      std::vector<cudaEvent_t> ev(2 * ROUNDS);
+      for (auto& e : ev) INGINE_TEST_CUDA(cudaEventCreate(&e));
+      for (int i = 0; i < ROUNDS; ++i) {
+        INGINE_TEST_CUDA(cudaMemsetAsync(junk.get(), i, flush_bytes, stream));
+        INGINE_TEST_CUDA(cudaEventRecord(ev[2 * i], stream));
+        d.advance(P);
+        INGINE_TEST_CUDA(cudaEventRecord(ev[2 * i + 1], stream));
+        d.advanced(3);
+        P += 3;
+      }
+      INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
+      std::vector<float> ms(ROUNDS);
+      for (int i = 0; i < ROUNDS; ++i) INGINE_TEST_CUDA(cudaEventElapsedTime(&ms[i], ev[2 * i], ev[2 * i + 1]));
+      for (auto& e : ev) cudaEventDestroy(e);
+      std::sort(ms.begin(), ms.end());
+      double mean = 0;
+      for (int i = ROUNDS / 10; i < ROUNDS - ROUNDS / 10; ++i) mean += ms[i];  // trimmed: the GPU is shared
+      mean /= double(ROUNDS - 2 * (ROUNDS / 10));
+      std::printf("BENCH context %6d T %.0f: round transition %.4f ms (median %.4f, min %.4f)\n", len, double(T), mean,
+                  ms[ROUNDS / 2], ms[0]);
+      std::fflush(stdout);
+      // back to the context of `len` rows: the rounds committed 3 * ROUNDS rows of the same taps
+      len = P;
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -89,6 +196,7 @@ int main() {
   }
   cudaStream_t stream;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  if (const char* on = std::getenv("INGINE_BENCH"); on && *on == '1') return bench(dir, stream);
 
   // synthetic target: embedding, its norm, FP8-row unembedding of V tokens
   Rng r(5);

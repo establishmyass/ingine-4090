@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <functional>
 #include <numeric>
 #include <vector>
 
@@ -40,6 +42,59 @@ std::vector<float> to_float(const std::vector<bf16>& v) {
 }
 float bfr(float x) { return round_bf16(x); }
 
+// float8_e4m3fn: the nearest code (ties to the even code, saturating at +-448) and its value
+uint8_t e4m3_encode(float x) {
+  static const std::vector<float> values = [] {
+    std::vector<float> v(127);  // codes 0..126 ascend from 0 to 448 (127 is NaN)
+    for (int c = 0; c < 127; ++c) v[c] = e4m3_to_float(uint8_t(c));
+    return v;
+  }();
+  const float a = std::fabs(x);
+  int hi = int(std::lower_bound(values.begin(), values.end(), a) - values.begin());  // first value >= a
+  int best = hi;
+  if (hi == 127) {
+    best = 126;
+  } else if (hi > 0) {
+    const float up = values[hi] - a, down = a - values[hi - 1];
+    best = up < down || (up == down && (hi & 1) == 0) ? hi : hi - 1;
+  }
+  return uint8_t(best | (std::signbit(x) ? 0x80 : 0));
+}
+float e4m3r(float x) { return e4m3_to_float(e4m3_encode(x)); }
+
+// a key/value cache as floats: BF16 or E4M3 rows
+std::vector<float> cache_floats(const DeviceArray<uint8_t>& a, bool fp8) {
+  const auto raw = a.download();
+  std::vector<float> f(fp8 ? raw.size() : raw.size() / 2);
+  for (size_t i = 0; i < f.size(); ++i) {
+    if (fp8) {
+      f[i] = e4m3_to_float(raw[i]);
+    } else {
+      bf16 b;
+      std::memcpy(&b, &raw[2 * i], 2);
+      f[i] = bf16_to_float(b);
+    }
+  }
+  return f;
+}
+std::vector<uint8_t> cache_bytes(const std::vector<float>& f, bool fp8) {
+  std::vector<uint8_t> raw(fp8 ? f.size() : 2 * f.size());
+  for (size_t i = 0; i < f.size(); ++i) {
+    if (fp8) {
+      raw[i] = e4m3_encode(f[i]);
+    } else {
+      const bf16 b = float_to_bf16(f[i]);
+      std::memcpy(&raw[2 * i], &b, 2);
+    }
+  }
+  return raw;
+}
+
+// cache contents against BF16 reference values: within `ulps` BF16 ulps (check_close), or for E4M3 rows the
+// E4M3 rounding of a value that close to the reference
+bool check_cache(const std::vector<float>& got, const std::vector<float>& ref, bool fp8, const char* what,
+                 double ulps = 2.0, double floor = 1e-3);
+
 // every |got - ref| within `ulps` BF16 ulps of max(|ref|, floor)
 bool check_close(const std::vector<float>& got, const std::vector<float>& ref, const char* what, double ulps = 2.0,
            double floor = 1e-3) {
@@ -58,6 +113,21 @@ bool check_close(const std::vector<float>& got, const std::vector<float>& ref, c
               ref.empty() ? 0.0 : double(got[wi]), ref.empty() ? 0.0 : double(ref[wi]));
   if (!ok) ++g_failures;
   return ok;
+}
+
+bool check_cache(const std::vector<float>& got, const std::vector<float>& ref, bool fp8, const char* what, double ulps,
+                 double floor) {
+  if (!fp8) return check_close(got, ref, what, ulps, floor);
+  size_t bad = 0, first = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const float tol = float(ulps * std::max(std::fabs(double(ref[i])), floor) * std::ldexp(1.0, -7));
+    if (!(got[i] >= e4m3r(ref[i] - tol) && got[i] <= e4m3r(ref[i] + tol)) && bad++ == 0) first = i;
+  }
+  std::printf("%s %s: %zu of %zu values are not the E4M3 rounding (first at %zu: got %.6g ref %.6g)\n",
+              bad ? "FAIL" : "PASS", what, bad, ref.size(), first, ref.empty() ? 0.0 : double(got[first]),
+              ref.empty() ? 0.0 : double(ref[first]));
+  if (bad) ++g_failures;
+  return bad == 0;
 }
 
 std::vector<float> download_bf16(const DeviceArray<bf16>& a) { return to_float(a.download()); }
@@ -128,8 +198,8 @@ void test_ctx_kv_store(Rng& r) {
     auto kn = rand_bf16(r, D, 0.5);
     DeviceArray<bf16> d_kv(kv), d_kn(kn), d_k(size_t(size) * kd::KV_DIM), d_v(size_t(size) * kd::KV_DIM);
     DeviceArray<int32_t> d_pos(std::vector<int32_t>(size, -1));
-    kd::ctx_kv_store(d_kv.get(), n, p.get(), row0, keep_from, d_kn.get(), d_k.get(), d_v.get(), size, d_pos.get(),
-                     nullptr);
+    kd::ctx_kv_store(d_kv.get(), n, p.get(), row0, keep_from, d_kn.get(), d_k.get(), d_v.get(), false, size,
+                     d_pos.get(), nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     const auto kvf = to_float(kv), knf = to_float(kn);
     std::vector<float> ref_k(size_t(size) * kd::KV_DIM, 0.f), ref_v(size_t(size) * kd::KV_DIM, 0.f);
@@ -148,10 +218,18 @@ void test_ctx_kv_store(Rng& r) {
     check_close(download_bf16(d_k), ref_k, n > size ? "ctx_kv_store k (wrapped)" : "ctx_kv_store k");
     check_close(download_bf16(d_v), ref_v, "ctx_kv_store v", 0.0, 1e-30);
     expect(d_pos.download() == ref_pos, "ctx_kv_store ctx_pos");
+    // the global ring: E4M3 rows, no position tags
+    DeviceArray<uint8_t> d_k8(size_t(size) * kd::KV_DIM), d_v8(size_t(size) * kd::KV_DIM);
+    kd::ctx_kv_store(d_kv.get(), n, p.get(), row0, keep_from, d_kn.get(), d_k8.get(), d_v8.get(), true, size, nullptr,
+                     nullptr);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    check_cache(cache_floats(d_k8, true), ref_k, true, "ctx_kv_store k (E4M3)");
+    check_cache(cache_floats(d_v8, true), ref_v, true, "ctx_kv_store v (E4M3)", 0.0, 1e-30);
   }
 }
 
-// set_round (the device-side round transition) + commit_mix + commit_store (the small commit)
+// round_begin (the device-side round transition: parameters, commit_mix and embed_block in one launch) and
+// commit_store (the small commit)
 void test_small_commit(Rng& r) {
   const int widths[3] = {2, 4, 8};
   std::vector<std::vector<bf16>> taps;
@@ -164,7 +242,8 @@ void test_small_commit(Rng& r) {
   auto alpha = rand_bf16(r, 16, 0.5);
   auto f_norm = rand_bf16(r, H, 0.3);
   std::vector<std::vector<bf16>> ctx_norm, k_norm;
-  std::vector<DeviceArray<bf16>> d_ctx_norm, d_k_norm, d_k, d_v;
+  std::vector<DeviceArray<bf16>> d_ctx_norm, d_k_norm;
+  std::vector<DeviceArray<uint8_t>> d_k, d_v;  // layer 1 (the global ring): E4M3 rows
   std::vector<DeviceArray<int32_t>> d_pos;
   const int sizes[3] = {16, 64, 16};
   kd::CtxLayers L;
@@ -180,13 +259,14 @@ void test_small_commit(Rng& r) {
   for (int l = 0; l < 3; ++l) {
     d_ctx_norm.emplace_back(ctx_norm[l]);
     d_k_norm.emplace_back(k_norm[l]);
-    d_k.emplace_back(size_t(sizes[l]) * kd::KV_DIM);
-    d_v.emplace_back(size_t(sizes[l]) * kd::KV_DIM);
+    d_k.emplace_back(size_t(sizes[l]) * kd::KV_DIM * (l == 1 ? 1 : 2));
+    d_v.emplace_back(size_t(sizes[l]) * kd::KV_DIM * (l == 1 ? 1 : 2));
     d_pos.emplace_back(std::vector<int32_t>(sizes[l], -1));
     L.ctx_norm[l] = d_ctx_norm[l].get();
     L.k_norm_ctx[l] = d_k_norm[l].get();
     L.k_cache[l] = d_k[l].get();
     L.v_cache[l] = d_v[l].get();
+    L.fp8[l] = l == 1;
     L.ctx_pos[l] = l == 1 ? nullptr : d_pos[l].get();
     L.size[l] = sizes[l];
   }
@@ -194,6 +274,15 @@ void test_small_commit(Rng& r) {
   DeviceArray<kd::DraftParams> p(1);
   DeviceArray<int32_t> d_m(1), d_acc(1), d_next(std::vector<int32_t>{4321}), d_next_s(std::vector<int32_t>{777});
   const auto af = to_float(alpha), fnf = to_float(f_norm);
+  // the block's input rows: an embedding holding the two next-anchor tokens
+  const int EV = 4400;
+  auto embed = rand_bf16(r, size_t(EV) * H), mask = rand_bf16(r, H), in_norm = rand_bf16(r, H, 0.5);
+  std::vector<float> en(H);
+  for (auto& x : en) x = float(r.uniform(0.5, 1.5));
+  DeviceArray<bf16> d_embed(embed), d_mask(mask), d_in(in_norm), d_res(size_t(8) * H), d_xn(size_t(8) * H),
+      d_res2(size_t(8) * H), d_xn2(size_t(8) * H);
+  DeviceArray<float> d_en(en);
+  DeviceArray<unsigned long long> d_picks(std::vector<unsigned long long>(7, 123)), d_picks2(7);
   struct Case {
     int m, acc, start;
     float T;
@@ -212,18 +301,26 @@ void test_small_commit(Rng& r) {
     in.accepted = d_acc.get();
     in.next_greedy = d_next.get();
     in.next_sampled = d_next_s.get();
-    kd::set_round(p.get(), in, nullptr);
+    kd::round_begin(p.get(), in, d_alpha.get(), L, d_f_norm.get(), d_embed.get(), d_en.get(), d_mask.get(), d_in.get(),
+                    d_xin.get(), d_f_rnn.get(), d_res.get(), d_xn.get(), d_picks.get(), nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     const int wi = c.m == 2 ? 0 : (c.m == 4 ? 1 : 2), n = c.acc + 1;
     const kd::DraftParams got = p.download()[0];
     char what[96];
-    std::snprintf(what, sizeof(what), "set_round m=%d accepted=%d T=%.1f", c.m, c.acc, c.T);
+    std::snprintf(what, sizeof(what), "round_begin parameters m=%d accepted=%d T=%.1f", c.m, c.acc, c.T);
     expect(got.ncommit == n && got.commit_feats == d_taps[wi].get() && got.start == c.start &&
                got.P == c.start + n && got.anchor == (c.T > 0.f ? 777 : 4321) && got.temperature == c.T &&
                got.seed == 1,
            what);
+    // its block rows are embed_block's for the published anchor
+    kd::embed_block(d_embed.get(), d_en.get(), d_mask.get(), d_in.get(), p.get(), d_res2.get(), d_xn2.get(),
+                    d_picks2.get(), nullptr);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    const auto picks = d_picks.download();
+    expect(download_bf16(d_res) == download_bf16(d_res2) && download_bf16(d_xn) == download_bf16(d_xn2) &&
+               std::all_of(picks.begin(), picks.end(), [](auto v) { return v == 0; }),
+           "round_begin block rows == embed_block");
 
-    kd::commit_mix(p.get(), d_alpha.get(), L, d_f_norm.get(), d_xin.get(), d_f_rnn.get(), nullptr);
     std::vector<float> kv(size_t(8) * 3 * 2 * kd::KV_DIM);
     for (auto& x : kv) x = bfr(float(r.normal()));
     DeviceArray<float> d_kv(kv);
@@ -251,7 +348,7 @@ void test_small_commit(Rng& r) {
     check_close(download_bf16(d_f_rnn), mix(n - 1, 3, fnf), what);
 
     for (int l = 0; l < 3; ++l) {
-      const auto k = download_bf16(d_k[l]), v = download_bf16(d_v[l]);
+      const auto k = cache_floats(d_k[l], l == 1), v = cache_floats(d_v[l], l == 1);
       const auto pos = d_pos[l].download();
       const auto knf = to_float(k_norm[l]);
       std::vector<float> got_k, got_v, ref_k, ref_v;
@@ -271,9 +368,9 @@ void test_small_commit(Rng& r) {
       }
       // RoPE outputs near zero come from cancellation: absolute tolerance at the head's scale
       std::snprintf(what, sizeof(what), "commit_store layer %d k (n=%d)", l, n);
-      check_close(got_k, ref_k, what, 2.0, 2e-2);
+      check_cache(got_k, ref_k, l == 1, what, 2.0, 2e-2);
       std::snprintf(what, sizeof(what), "commit_store layer %d v", l);
-      check_close(got_v, ref_v, what, 0.0, 1e-30);
+      check_cache(got_v, ref_v, l == 1, what, 0.0, 1e-30);
       std::snprintf(what, sizeof(what), "commit_store layer %d ctx_pos", l);
       expect(pos_ok, what);
     }
@@ -320,10 +417,22 @@ void test_qkv_rope(Rng& r) {
   DeviceArray<kd::DraftParams> p(1);
   set_params(p.get(), 0, P, 0.f, 0, 1);
   const auto qnf = to_float(qn), knf = to_float(kn);
-  for (const bool local : {true, false}) {
+  struct Kind {
+    bool local, fp8;
+    const char* q;
+    const char* k;
+    const char* v;
+  };
+  for (const Kind kind : {Kind{true, false, "qkv_rope q (local)", "qkv_rope k (local)", "qkv_rope v (local)"},
+                          Kind{false, false, "qkv_rope q (global)", "qkv_rope k (global)", "qkv_rope v (global)"},
+                          Kind{false, true, "qkv_rope q (global E4M3)", "qkv_rope k (global E4M3)",
+                               "qkv_rope v (global E4M3)"}}) {
+    const bool local = kind.local;
     const int slots = local ? kd::WINDOW + 8 : ctx;
-    DeviceArray<bf16> d_k(size_t(slots) * kd::KV_DIM), d_v(size_t(slots) * kd::KV_DIM);
-    kd::qkv_rope(d_qkv.get(), d_qn.get(), d_kn.get(), p.get(), d_q.get(), d_k.get(), d_v.get(), local, ctx, nullptr);
+    DeviceArray<uint8_t> d_k(size_t(slots) * kd::KV_DIM * (kind.fp8 ? 1 : 2)),
+        d_v(size_t(slots) * kd::KV_DIM * (kind.fp8 ? 1 : 2));
+    kd::qkv_rope(d_qkv.get(), d_qn.get(), d_kn.get(), p.get(), d_q.get(), d_k.get(), d_v.get(), kind.fp8, local, ctx,
+                 nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     std::vector<float> ref_q(size_t(8) * kd::Q_DIM), ref_k(size_t(slots) * kd::KV_DIM, 0.f),
         ref_v(size_t(slots) * kd::KV_DIM, 0.f);
@@ -341,9 +450,9 @@ void test_qkv_rope(Rng& r) {
                   ref_v.begin() + (size_t(slot) * kd::KV_HEADS + g) * D);
       }
     }
-    check_close(download_bf16(d_q), ref_q, local ? "qkv_rope q (local)" : "qkv_rope q (global)");
-    check_close(download_bf16(d_k), ref_k, local ? "qkv_rope k (local)" : "qkv_rope k (global)");
-    check_close(download_bf16(d_v), ref_v, "qkv_rope v", 0.0, 1e-30);
+    check_close(download_bf16(d_q), ref_q, kind.q);
+    check_cache(cache_floats(d_k, kind.fp8), ref_k, kind.fp8, kind.k);
+    check_cache(cache_floats(d_v, kind.fp8), ref_v, kind.fp8, kind.v, 0.0, 1e-30);
   }
 }
 
@@ -351,26 +460,38 @@ void test_block_attention(Rng& r) {
   struct Case {
     bool local;
     int nkeys, P;
-    bool holes;  // local: whole 64-slot tiles empty (skipped tiles)
+    bool holes;  // local: whole runs of slots empty
+    bool fp8;    // global: E4M3 cache rows
     const char* name;
   };
-  // every chunking class: one 64-key tile per CTA (<= 8192 keys) and 2 / 8 tiles per CTA (16K, 64K keys)
-  const Case cases[] = {{true, kd::WINDOW + 8, 1500, false, "attention local (wrapped ring)"},
-                        {true, kd::WINDOW + 8, 1500, true, "attention local (wrapped ring, empty tiles)"},
-                        {true, kd::WINDOW + 8, 300, false, "attention local (partial ring)"},
-                        {true, kd::WINDOW + 8, 0, false, "attention local (empty ring)"},
-                        {false, 1536, 1300, false, "attention global (masked tail)"},
-                        {false, 1024, 2000, false, "attention global (full ring)"},
-                        {false, 2048, 5, false, "attention global (short context)"},
-                        {false, 8192, 7000, false, "attention global 8K (masked tail)"},
-                        {false, 16384, 20000, false, "attention global 16K (2 tiles per chunk)"},
-                        {false, 65536, 40000, false, "attention global 64K (8 tiles per chunk, masked tail)"}};
+  // every chunking class: local (2 tiles of 16 keys per CTA), global with 2 tiles per CTA (<= 4096 keys) and
+  // 4 / 8 / 32 tiles per CTA (8K, 16K, 64K keys)
+  const Case cases[] = {{true, kd::WINDOW + 8, 1500, false, false, "attention local (wrapped ring)"},
+                        {true, kd::WINDOW + 8, 1500, true, false, "attention local (wrapped ring, empty runs)"},
+                        {true, kd::WINDOW + 8, 300, false, false, "attention local (partial ring)"},
+                        {true, kd::WINDOW + 8, 0, false, false, "attention local (empty ring)"},
+                        {false, 1536, 1300, false, false, "attention global (masked tail)"},
+                        {false, 1024, 2000, false, false, "attention global (full ring)"},
+                        {false, 2048, 5, false, false, "attention global (short context)"},
+                        {false, 1000, 990, false, false, "attention global (ring not a multiple of a tile)"},
+                        {false, 8192, 7000, false, false, "attention global 8K (masked tail)"},
+                        {false, 16384, 20000, false, false, "attention global 16K"},
+                        {false, 65536, 40000, false, false, "attention global 64K (masked tail)"},
+                        {false, 1536, 1300, false, true, "attention global E4M3 (masked tail)"},
+                        {false, 2048, 5, false, true, "attention global E4M3 (short context)"},
+                        {false, 1000, 2000, false, true, "attention global E4M3 (ring not a multiple of a tile)"},
+                        {false, 65536, 40003, false, true, "attention global E4M3 64K (masked tail)"}};
   DeviceArray<kd::DraftParams> p(1);
   for (const Case& c : cases) {
     set_params(p.get(), 0, c.P, 0.f, 0, 1);
     auto q = rand_bf16(r, size_t(8) * kd::Q_DIM);
-    auto k = rand_bf16(r, size_t(c.nkeys) * kd::KV_DIM);
-    auto v = rand_bf16(r, size_t(c.nkeys) * kd::KV_DIM);
+    auto kf = to_float(rand_bf16(r, size_t(c.nkeys) * kd::KV_DIM));
+    auto vf = to_float(rand_bf16(r, size_t(c.nkeys) * kd::KV_DIM));
+    const std::vector<uint8_t> kb = cache_bytes(kf, c.fp8), vb = cache_bytes(vf, c.fp8);
+    if (c.fp8) {  // the stored values
+      for (size_t i = 0; i < kb.size(); ++i) kf[i] = e4m3_to_float(kb[i]);
+      for (size_t i = 0; i < vb.size(); ++i) vf[i] = e4m3_to_float(vb[i]);
+    }
     std::vector<int32_t> cpos(kd::WINDOW);
     for (int j = 0; j < kd::WINDOW; ++j) {
       // the ring as commits leave it: slot j holds the latest position = j mod 1024 below P, some empty
@@ -378,14 +499,18 @@ void test_block_attention(Rng& r) {
       cpos[j] = pos >= 0 && r.uniform() > 0.05 ? pos : -1;
       if (c.holes && ((j >= 128 && j < 320) || j >= 960)) cpos[j] = -1;
     }
-    DeviceArray<bf16> d_q(q), d_k(k), d_v(v), d_o(size_t(8) * kd::Q_DIM);
+    DeviceArray<bf16> d_q(q), d_o(size_t(8) * kd::Q_DIM);
+    DeviceArray<uint8_t> d_k(kb), d_v(vb);
     DeviceArray<int32_t> d_cpos(cpos);
     DeviceArray<float> ws(kd::attention_workspace_floats(c.nkeys));
-    kd::block_attention(d_q.get(), d_k.get(), d_v.get(), c.nkeys, c.local ? d_cpos.get() : nullptr, p.get(), ws.get(),
-                        d_o.get(), nullptr);
+    kd::block_attention(d_q.get(), d_k.get(), d_v.get(), c.nkeys, c.local ? d_cpos.get() : nullptr, c.fp8, p.get(),
+                        ws.get(), d_o.get(), nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    const auto qf = to_float(q), kf = to_float(k), vf = to_float(v);
-    std::vector<float> ref(size_t(8) * kd::Q_DIM);
+    const auto qf = to_float(q);
+    // The kernel rounds the probabilities to BF16 (the value mma's operand): the error of an output is
+    // bounded by 2^-9 of sum_j p_j |v_j| (plus the FP32 score and softmax errors), not by an ulp of the
+    // output itself (values cancel).
+    std::vector<float> ref(size_t(8) * kd::Q_DIM), bound(size_t(8) * kd::Q_DIM);
     for (int h = 0; h < kd::HEADS; ++h) {
       const int g = h / 3;
       for (int i = 0; i < 8; ++i) {
@@ -403,17 +528,31 @@ void test_block_attention(Rng& r) {
           m = std::max(m, s[j]);
         }
         double l = 0;
-        std::vector<double> o(D, 0.0);
+        std::vector<double> o(D, 0.0), oa(D, 0.0);
         for (int j = 0; j < c.nkeys; ++j) {
           if (s[j] == -INFINITY) continue;
           const double e = std::exp(s[j] - m);
           l += e;
-          for (int d = 0; d < D; ++d) o[d] += e * vf[(size_t(j) * kd::KV_HEADS + g) * D + d];
+          for (int d = 0; d < D; ++d) {
+            const double v = vf[(size_t(j) * kd::KV_HEADS + g) * D + d];
+            o[d] += e * v;
+            oa[d] += e * std::fabs(v);
+          }
         }
-        for (int d = 0; d < D; ++d) ref[size_t(i) * kd::Q_DIM + h * D + d] = bfr(float(o[d] / l));
+        for (int d = 0; d < D; ++d) {
+          ref[size_t(i) * kd::Q_DIM + h * D + d] = bfr(float(o[d] / l));
+          bound[size_t(i) * kd::Q_DIM + h * D + d] = float(oa[d] / l);
+        }
       }
     }
-    check_close(download_bf16(d_o), ref, c.name, 2.0, 1e-2);
+    const auto got = download_bf16(d_o);
+    double worst = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      const double tol = std::ldexp(double(bound[i]), -8) + std::ldexp(std::fabs(double(ref[i])), -7);
+      worst = std::max(worst, std::fabs(double(got[i]) - double(ref[i])) / tol);
+    }
+    std::printf("%s %s: worst error %.2f of the BF16-probability bound\n", worst <= 1.0 ? "PASS" : "FAIL", c.name, worst);
+    expect(worst <= 1.0, c.name);
   }
 }
 
@@ -447,12 +586,17 @@ void test_add_rmsnorm_silu(Rng& r) {
   check_close(download_bf16(d_act), ref_act, "silu_mul");
 }
 
-// reference top-k: value descending, index ascending
+// reference top-k: the elements above the 1024th value by ascending index, then the lowest-index elements
+// equal to it
 std::vector<int> topk_ref(const float* x, int V) {
-  std::vector<int> idx(V);
-  std::iota(idx.begin(), idx.end(), 0);
-  std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return x[a] > x[b]; });
-  idx.resize(kd::CANDIDATES);
+  std::vector<float> sorted(x, x + V);
+  std::nth_element(sorted.begin(), sorted.begin() + (kd::CANDIDATES - 1), sorted.end(), std::greater<float>());
+  const float T = sorted[kd::CANDIDATES - 1];
+  std::vector<int> idx;
+  for (int i = 0; i < V; ++i)
+    if (x[i] > T) idx.push_back(i);
+  for (int i = 0; i < V && int(idx.size()) < kd::CANDIDATES; ++i)
+    if (x[i] == T) idx.push_back(i);
   return idx;
 }
 
@@ -473,29 +617,34 @@ void test_topk(Rng& r) {
         base[size_t(i) * V + x] = bfr(float(v));
       }
     DeviceArray<float> d_base(base), d_val(size_t(rows) * kd::CANDIDATES);
-    DeviceArray<int32_t> d_idx(size_t(rows) * kd::CANDIDATES);
+    DeviceArray<int32_t> d_idx(size_t(rows) * kd::CANDIDATES), d_mapped(size_t(rows) * kd::CANDIDATES);
     DeviceArray<uint8_t> ws(kd::topk_workspace_bytes(rows, V));
-    kd::topk_candidates(d_base.get(), rows, V, d_val.get(), d_idx.get(), ws.get(), nullptr);
+    std::vector<int32_t> map(V);  // element -> token id, as a shortlist head's rows
+    for (int x = 0; x < V; ++x) map[x] = 7 * x + 3;
+    DeviceArray<int32_t> d_map(map);
+    kd::topk_candidates(d_base.get(), rows, V, nullptr, d_val.get(), d_idx.get(), ws.get(), nullptr);
+    kd::topk_candidates(d_base.get(), rows, V, d_map.get(), d_val.get(), d_mapped.get(), ws.get(), nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     const auto val = d_val.download();
     const auto idx = d_idx.download();
+    const auto mapped = d_mapped.download();
     for (int i = 0; i < rows; ++i) {
       const auto ref = topk_ref(base.data() + size_t(i) * V, V);
-      bool ok = true;
-      for (int k = 0; k < kd::CANDIDATES; ++k) {
+      bool ok = int(ref.size()) == kd::CANDIDATES;
+      for (int k = 0; ok && k < kd::CANDIDATES; ++k) {
         ok &= idx[size_t(i) * kd::CANDIDATES + k] == ref[k];
+        ok &= mapped[size_t(i) * kd::CANDIDATES + k] == map[ref[k]];
         ok &= val[size_t(i) * kd::CANDIDATES + k] == base[size_t(i) * V + ref[k]];
       }
       char what[96];
-      std::snprintf(what, sizeof(what), "topk_candidates V=%d %s (sorted, ties by index)", V, names[i]);
+      std::snprintf(what, sizeof(what), "topk_candidates V=%d %s (index order, ties by index, mapped)", V, names[i]);
       std::printf("%s %s\n", ok ? "PASS" : "FAIL", what);
       expect(ok, what);
     }
   }
 }
 
-// gather_head_rows copies the chosen rows (FP8 + scales, or BF16) and records their ids; map_candidates
-// turns shortlist rows into token ids.
+// gather_head_rows copies the chosen rows (FP8 + scales, or BF16) and records their ids.
 void test_shortlist_head(Rng& r) {
   const int V = 3000, n = 777;
   for (const bool fp8 : {true, false}) {
@@ -524,16 +673,6 @@ void test_shortlist_head(Rng& r) {
     }
     for (int i = 0; i < 5; ++i) ok &= map[i] == 0 && dscale[i] == 0.f;  // rows before untouched
     expect(ok, fp8 ? "gather_head_rows FP8 rows + scales" : "gather_head_rows BF16 rows");
-    // map_candidates over [7, 1024] candidate rows of this shortlist
-    std::vector<int32_t> cand(std::size_t(kd::GAMMA) * kd::CANDIDATES);
-    for (auto& c : cand) c = 5 + int32_t(r.uniform(0, n));
-    DeviceArray<int32_t> d_cand(cand);
-    kd::map_candidates(d_cand.get(), int(cand.size()), d_map.get(), nullptr);
-    INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    const auto mapped = d_cand.download();
-    bool ok_map = true;
-    for (std::size_t i = 0; i < cand.size(); ++i) ok_map &= mapped[i] == map[cand[i]];
-    expect(ok_map, "map_candidates");
   }
 }
 
@@ -560,7 +699,7 @@ void test_markov(Rng& r) {
   DeviceArray<unsigned long long> d_picks(kd::GAMMA);
   DeviceArray<kd::DraftParams> p(1);
   DeviceArray<uint8_t> topk_ws(kd::topk_workspace_bytes(kd::GAMMA, V));
-  kd::topk_candidates(d_base.get(), kd::GAMMA, V, d_val.get(), d_idx.get(), topk_ws.get(), nullptr);
+  kd::topk_candidates(d_base.get(), kd::GAMMA, V, nullptr, d_val.get(), d_idx.get(), topk_ws.get(), nullptr);
   kd::markov_pre(d_rnn_w.get(), d_h.get(), d_f.get(), d_part.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto cand_val = d_val.download();

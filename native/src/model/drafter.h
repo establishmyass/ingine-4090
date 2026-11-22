@@ -1,12 +1,17 @@
-// DSpark drafter for Inkling-2-Mini (mtp.safetensors): C++ port of engine/ingine/dspark.py Drafter.
+// DSpark drafter for Inkling-2-Mini (mtp.safetensors): C++ port of engine/ingine/dspark.py Drafter. Any draft
+// distribution is valid for the speculative loop (greedy drafts are checked by equality, sampled ones accepted
+// against the q they were drawn from), so the drafter's own weights and arithmetic are approximated where it
+// buys time; only acceptance and draft time matter.
 //
 // * Target taps per processed row (bf16 [n, 4, H]: the partial block entering visits 5, 23, 41 and the final
 //   normed hidden) become draft context through commit(): per draft layer l, c = mix_rmsnorm(feats,
 //   alpha[l]), k = rope(rmsnorm_128(c Wk_ctx)), v = c Wv_ctx. Layers 0 and 2 keep the last WINDOW = 1024
-//   positions in a ring (plus 8 rows for the block being drafted); layer 1 a ring of ctx = min(max_ctx,
-//   DRAFT_CTX) slots (slot = position % ctx).
+//   positions in a BF16 ring (plus 8 rows for the block being drafted); layer 1 a ring of ctx = min(max_ctx,
+//   DRAFT_CTX) slots (slot = position % ctx) with E4M3 keys and values: over a long context its bytes bound
+//   the draft.
 // * draft() runs the 8-row block (anchor embedding + 7 mask rows) through 3 bidirectional layers with
-//   FP8-row q/k/v and gate/up projections (the dense GEMV kernel) and BF16 o/down projections, then the
+//   FP8-row projections (q/k/v, o, gate/up, down: the dense GEMV kernels) and tensor-core block attention
+//   (kernels/draft/attention.cu), then the
 //   Markov head over each step's top-1024 base-logit candidates. The base logits are scored over a shortlist
 //   head instead of the whole unembedding: the SHORTLIST_ROWS most frequent tokens (kernels/draft/shortlist.h),
 //   the special tokens, and up to CONTEXT_ROWS tokens of the current context (note_tokens), so drafts can only
@@ -89,7 +94,7 @@ class Drafter {
 
   // A speculative round's transition, entirely from device values (no host synchronisation), for a verify
   // call at the last draft's position `start`: commits the accepted rows (n = *in.accepted + 1 rows of the
-  // taps of width *in.m) and drafts for the next anchor at start + n (kernels::draft::set_round).
+  // taps of width *in.m) and drafts for the next anchor at start + n (kernels::draft::round_begin).
   // bind_round() fixes the inputs and captures one graph per context bucket (after capture()); advance()
   // replays the one for `start`. length() is unknown until advanced(n) reports n.
   void bind_round(const kernels::draft::RoundInputs& in);
@@ -135,16 +140,16 @@ class Drafter {
   struct DraftLayer {
     const __nv_bfloat16 *in_norm, *post_norm, *ctx_norm, *q_norm, *k_norm, *k_norm_ctx;
     kernels::dense::Matrix qkv, gate_up;  // FP8 rows + scales
-    const __nv_bfloat16* wo;              // [H, 3072]
-    const __nv_bfloat16* w_down;          // [H, inter]
-    const __nv_bfloat16* wkv_ctx;         // [2048, H]: k_proj_ctx | v_proj_ctx (a view into wkv_all_)
-    __nv_bfloat16 *k_ctx, *v_ctx;         // [slots, 8, 128]
+    kernels::dense::Matrix wo, w_down;    // FP8 rows + scales: [H, 3072], [H, inter]
+    const __nv_bfloat16* wkv_ctx;         // BF16 [2048, H]: k_proj_ctx | v_proj_ctx (large commits)
+    void *k_ctx, *v_ctx;                  // [slots, 8, 128]: BF16 (local rings), BF16 or E4M3 (the global ring)
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
 
   void* alloc(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
+  void run_layers(int bucket);                                                  // a draft after its input rows
   void run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece);  // large commits
   void run_small_commit();                                                      // from params_
   void run_advance(int bucket);                                                 // round transition
@@ -181,7 +186,7 @@ class Drafter {
   std::vector<std::int32_t> checkpoint_extra_;  // the context tokens of the checkpoint
   void restore_from(const void* src, int length, const std::vector<std::int32_t>& extra, bool global_slots);
   void set_context_rows(int rows);        // drops context rows past `rows` (stream-ordered)
-  kernels::dense::Matrix wkv_all_{};      // BF16 [3 * 2048, H]: the three layers' k/v context projections
+  kernels::dense::Matrix wkv_all_{};      // FP8 rows [3 * 2048, H]: the three layers' k/v context projections
   kernels::draft::CtxLayers ctx_layers_{};
 
   // per-call state and scratch

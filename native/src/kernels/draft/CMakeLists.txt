@@ -15,6 +15,7 @@ file(COPY_FILE ${_shortlist_cpp}.tmp ${_shortlist_cpp} ONLY_IF_DIFFERENT)
 
 add_library(ingine_kernels_draft STATIC
   accept.cu
+  attention.cu
   block.cu
   fold.cu
   gemm.cpp

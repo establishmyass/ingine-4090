@@ -42,7 +42,7 @@ struct DraftParams {
   std::uint64_t seed = 0;       // Gumbel noise: gumbel(seed, draws, step, candidate) (rng.h)
   std::uint64_t draws = 0;      // drafts so far (advanced by markov_finish)
   std::int32_t ncommit = 0;     // rows of the small commit (1..BLOCK)
-  std::int32_t pad = 0;
+  std::int32_t round_start = 0; // P of the last draft (set_draft_inputs, markov_finish): where a round commits
   const __nv_bfloat16* commit_feats = nullptr;  // their taps, bf16 [ncommit, 4, H]
 };
 void set_draft_inputs(DraftParams* p, int anchor, int P, float temperature, cudaStream_t stream);
@@ -52,10 +52,10 @@ void set_seed(DraftParams* p, std::uint64_t seed, cudaStream_t stream);  // also
 void set_commit(DraftParams* p, const __nv_bfloat16* feats, int n, int start, cudaStream_t stream);
 
 // The device-side transition of a speculative round (engine._generate_spec after the acceptance), for a
-// verify call at the last draft's position: start = p->P. The call (width *m, rows start..start+*m-1)
-// accepted *accepted drafts; commit its first n = *accepted + 1 rows (taps[i] for m == widths[i], bf16
-// [m, 4, H]) at start, and draft next at P = start + n from the anchor *next_greedy (p->temperature <= 0)
-// or *next_sampled. The temperature stays.
+// verify call at the last draft's position: start = p->round_start. The call (width *m, rows
+// start..start+*m-1) accepted *accepted drafts; its first n = *accepted + 1 rows (taps[i] for m == widths[i],
+// bf16 [m, 4, H]) are committed at start, and the next draft is at P = start + n from the anchor
+// *next_greedy (p->temperature <= 0) or *next_sampled. The temperature stays. See round_begin.
 struct RoundInputs {
   const __nv_bfloat16* taps[3] = {};
   int widths[3] = {};
@@ -65,7 +65,6 @@ struct RoundInputs {
   const std::int32_t* next_greedy = nullptr;
   const std::int32_t* next_sampled = nullptr;
 };
-void set_round(DraftParams* p, const RoundInputs& in, cudaStream_t stream);
 
 // ---- context (commit) --------------------------------------------------------------------------------
 
@@ -74,20 +73,25 @@ void set_round(DraftParams* p, const RoundInputs& in, cudaStream_t stream);
 void mix_rmsnorm(const __nv_bfloat16* feats, int n, const __nv_bfloat16* alpha, const __nv_bfloat16* w,
                  __nv_bfloat16* out, cudaStream_t stream);
 
+// Cache rows (k_cache / v_cache, [slots, 8, 128]) are BF16, or float8_e4m3fn without a scale (`fp8`: the
+// BF16 value rounded to nearest even, saturated at +-448; keys are RMS-normed and values a normed input's
+// projection, both well inside the range). The local rings are BF16; the global ring may be either.
+
 // Commit of context keys/values: kv bf16 [n, 2048] = (c Wk_ctx^T | c Wv_ctx^T). Row r is at position
 // p->start + row0 + r; rows r >= keep_from are stored at slot position % size:
 // k = bf16(rope(bf16(rms(k_r per head) * k_norm))), v as is. ctx_pos (local rings, int32 [size]) gets the
 // position, or is null (global ring).
 void ctx_kv_store(const __nv_bfloat16* kv, int n, const DraftParams* p, int row0, int keep_from,
-                  const __nv_bfloat16* k_norm, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int size,
+                  const __nv_bfloat16* k_norm, void* k_cache, void* v_cache, bool fp8, int size,
                   std::int32_t* ctx_pos, cudaStream_t stream);
 
 // The three draft layers' context state, for the small (device-driven) commit.
 struct CtxLayers {
   const __nv_bfloat16* ctx_norm[3] = {};    // bf16 [H]
   const __nv_bfloat16* k_norm_ctx[3] = {};  // bf16 [128]
-  __nv_bfloat16* k_cache[3] = {};           // bf16 [size, 8, 128]
-  __nv_bfloat16* v_cache[3] = {};
+  void* k_cache[3] = {};                    // [size, 8, 128], BF16 or E4M3 (fp8)
+  void* v_cache[3] = {};
+  bool fp8[3] = {};
   std::int32_t* ctx_pos[3] = {};            // int32 [size] (local rings) or null (global ring)
   int size[3] = {};                         // ring slots (>= BLOCK)
 };
@@ -109,21 +113,30 @@ void embed_block(const __nv_bfloat16* embed, const float* embed_norm, const __nv
                  const __nv_bfloat16* in_norm, const DraftParams* p, __nv_bfloat16* res, __nv_bfloat16* xn,
                  unsigned long long* picks, cudaStream_t stream);
 
+// A round's transition in one launch: sets p (commit_feats, ncommit, start, anchor, P) from the round inputs,
+// and does commit_mix and embed_block for those values (the same arithmetic as the two launches).
+void round_begin(DraftParams* p, const RoundInputs& in, const __nv_bfloat16* alpha, const CtxLayers& L,
+                 const __nv_bfloat16* f_norm, const __nv_bfloat16* embed, const float* embed_norm,
+                 const __nv_bfloat16* mask_embed, const __nv_bfloat16* in_norm, __nv_bfloat16* xin,
+                 __nv_bfloat16* f_rnn, __nv_bfloat16* res, __nv_bfloat16* xn, unsigned long long* picks,
+                 cudaStream_t stream);
+
 // q/k/v of the block rows: qkv fp32 [8, 5120] (BF16 values). q, k: bf16(rope(bf16(rms_head * norm))) at
-// positions P + i; v as is. q -> q_out bf16 [8, 24, 128]. Keys/values go to the cache: local layers at
-// rows WINDOW + i (after the ring), the global layer at slot (P + i) % ctx.
+// positions P + i; v as is. q -> q_out bf16 [8, 24, 128]. Keys/values go to the cache (BF16 or E4M3 rows):
+// local layers at rows WINDOW + i (after the ring), the global layer at slot (P + i) % ctx.
 void qkv_rope(const float* qkv, const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, const DraftParams* p,
-              __nv_bfloat16* q_out, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, bool local, int ctx,
+              __nv_bfloat16* q_out, void* k_cache, void* v_cache, bool fp8, bool local, int ctx,
               cudaStream_t stream);
 
 // Bidirectional block attention (scale 1/sqrt(128), GQA head h -> kv head h / 3), out bf16 [8, 3072].
 // Local (ctx_pos != null): keys = ring rows [0, WINDOW) valid when P - WINDOW <= ctx_pos < P, plus the 8
-// block rows [WINDOW, WINDOW + 8); nkeys must be WINDOW + 8. Global (ctx_pos null): keys [0, nkeys) valid
-// below P + 8. ws: attention_workspace_floats(nkeys) floats.
+// block rows [WINDOW, WINDOW + 8); nkeys must be WINDOW + 8, BF16 rows. Global (ctx_pos null): keys
+// [0, nkeys) valid below P + 8, BF16 or E4M3 rows (fp8). Tensor cores: the softmax probabilities are rounded
+// to BF16 before they weigh the values. ws: attention_workspace_floats(nkeys) floats.
 std::size_t attention_workspace_floats(int nkeys);
-void block_attention(const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                     int nkeys, const std::int32_t* ctx_pos, const DraftParams* p, float* ws,
-                     __nv_bfloat16* out, cudaStream_t stream);
+void block_attention(const __nv_bfloat16* q, const void* k_cache, const void* v_cache, int nkeys,
+                     const std::int32_t* ctx_pos, bool fp8, const DraftParams* p, float* ws, __nv_bfloat16* out,
+                     cudaStream_t stream);
 
 // res = bf16(res + delta); xn = bf16(rms(res) * w). res, xn bf16 [rows, H], delta fp32 [rows, H] (BF16 values),
 // w bf16 [H].
@@ -135,17 +148,16 @@ void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStre
 
 // ---- Markov head ---------------------------------------------------------------------------------------
 
-// Top-CANDIDATES per row of base fp32 [rows, V] (BF16-representable values), sorted by value descending,
-// equal values by index ascending: cand_val fp32 [rows, 1024], cand_idx int32 [rows, 1024]. A radix select
-// over many CTAs per row; ws: topk_workspace_bytes(rows, V) bytes, zeroed before the first call (every call
-// leaves it zeroed).
+// Top-CANDIDATES per row of base fp32 [rows, V] (BF16-representable values): the elements above the 1024th
+// value and, of those equal to it, the ones with the lowest indices. Order (fixed, not sorted): the elements
+// above it by ascending index, then the ties by ascending index. cand_val fp32 [rows, 1024]; cand_idx int32
+// [rows, 1024] = the element's index, or map[index] (a shortlist head's row -> token id) if map is not null.
+// A radix select over many CTAs per row; ws: topk_workspace_bytes(rows, V) bytes, zeroed before the first
+// call (every call leaves its histograms zeroed).
 std::size_t topk_workspace_bytes(int rows, int V);
-void topk_candidates(const float* base, int rows, int V, float* cand_val, std::int32_t* cand_idx, void* ws,
-                     cudaStream_t stream);
+void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
+                     std::int32_t* cand_idx, void* ws, cudaStream_t stream);
 
-// Shortlist head (the base logits over a subset of the vocabulary): cand_idx[i] = map[cand_idx[i]] for n
-// entries (shortlist row -> token id).
-void map_candidates(std::int32_t* cand_idx, int n, const std::int32_t* map, cudaStream_t stream);
 // Copies head rows ids[0..n) of src [V, row_bytes] (+ the FP32 row scales of FP8 rows if src_scale) to dst
 // rows 0..n (+ dst_scale) and sets map[i] = ids[i]. row_bytes: a multiple of 16.
 void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,

@@ -30,6 +30,10 @@ namespace {
 constexpr int H = kd::H;
 constexpr int LOCAL_SLOTS = kd::WINDOW + kd::BLOCK;  // local ring + the drafted block's rows
 constexpr int COMMIT_PIECE = 1024;                   // eager commit rows per piece
+// The global ring's keys/values are E4M3 (kernels/draft/draft.h): a draft over a long context is bound by
+// the bytes of that ring. The local rings are BF16.
+constexpr bool GLOBAL_FP8 = true;
+constexpr std::size_t GLOBAL_SLOT_BYTES = std::size_t(kd::KV_DIM) * (GLOBAL_FP8 ? 1 : 2);  // of k or of v
 
 bool is_local(int l) { return l != 1; }  // dspark.LOCAL = (0, 2)
 
@@ -161,16 +165,17 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
 
   for (int l = 0; l < 3; ++l) {
     DraftLayer& L = layers_[l];
-    const int slots = is_local(l) ? LOCAL_SLOTS : ctx_;
-    L.k_ctx = bf16s(std::size_t(slots) * kd::KV_DIM);
-    L.v_ctx = bf16s(std::size_t(slots) * kd::KV_DIM);
-    CUDA_CHECK(cudaMemsetAsync(L.k_ctx, 0, std::size_t(slots) * kd::KV_DIM * 2, stream_));
-    CUDA_CHECK(cudaMemsetAsync(L.v_ctx, 0, std::size_t(slots) * kd::KV_DIM * 2, stream_));
+    const std::size_t bytes = is_local(l) ? std::size_t(LOCAL_SLOTS) * kd::KV_DIM * 2 : ctx_ * GLOBAL_SLOT_BYTES;
+    L.k_ctx = alloc(bytes);
+    L.v_ctx = alloc(bytes);
+    CUDA_CHECK(cudaMemsetAsync(L.k_ctx, 0, bytes, stream_));
+    CUDA_CHECK(cudaMemsetAsync(L.v_ctx, 0, bytes, stream_));
     L.ctx_pos = is_local(l) ? i32s(kd::WINDOW) : nullptr;
     ctx_layers_.ctx_norm[l] = L.ctx_norm;
     ctx_layers_.k_norm_ctx[l] = L.k_norm_ctx;
     ctx_layers_.k_cache[l] = L.k_ctx;
     ctx_layers_.v_cache[l] = L.v_ctx;
+    ctx_layers_.fp8[l] = !is_local(l) && GLOBAL_FP8;
     ctx_layers_.ctx_pos[l] = L.ctx_pos;
     ctx_layers_.size[l] = is_local(l) ? kd::WINDOW : ctx_;
   }
@@ -287,30 +292,32 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     alpha_ = d;
   }
 
-  // FP8 rows of a row-concatenation (kernels::dense::fp8_rows, as dense.fp8_rows in dspark)
+  // FP8 rows of a row-concatenation of [r, K] tensors (kernels::dense::fp8_rows, as dense.fp8_rows in dspark)
   DeviceBuffer cat(std::size_t(2) * I * h * 2);
-  auto fp8 = [&](std::initializer_list<std::pair<std::string, std::int64_t>> parts) {
+  auto fp8 = [&](std::initializer_list<std::pair<std::string, std::int64_t>> parts, std::int64_t K = H) {
     std::int64_t rows = 0;
     for (const auto& [name, r] : parts) {
-      const std::byte* s = src(name, {r, h});
-      CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cat.p) + rows * h * 2, s, std::size_t(r * h * 2),
+      const std::byte* s = src(name, {r, K});
+      CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cat.p) + rows * K * 2, s, std::size_t(r * K * 2),
                                  cudaMemcpyDeviceToDevice, stream_));
       rows += r;
     }
-    void* q = alloc(std::size_t(rows * h));
+    void* q = alloc(std::size_t(rows * K));
     auto* scale = static_cast<float*>(alloc(std::size_t(rows) * 4));
-    kdense::fp8_rows(static_cast<const __nv_bfloat16*>(cat.p), int(rows), H, q, scale, stream_);
+    kdense::fp8_rows(static_cast<const __nv_bfloat16*>(cat.p), int(rows), int(K), q, scale, stream_);
     return kdense::Matrix{q, scale, int(rows)};
   };
 
-  // the three layers' context k/v projections in one matrix (one dense GEMV for a small commit)
+  // the three layers' context k/v projections: BF16 for large commits (cuBLASLt), and one FP8-row matrix of
+  // all three for a small commit (one dense GEMV)
   {
     auto kv = [](int l, const char* x) { return "layers." + std::to_string(l) + ".self_attn." + x + "_proj_ctx.weight"; };
     const std::vector<std::int64_t> shape{kd::KV_DIM, h};
     const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
                                         {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
-    wkv_all_ = kdense::Matrix{all, nullptr, 3 * 2 * kd::KV_DIM};
     for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
+    wkv_all_ = fp8({{kv(0, "k"), kd::KV_DIM}, {kv(0, "v"), kd::KV_DIM}, {kv(1, "k"), kd::KV_DIM},
+                    {kv(1, "v"), kd::KV_DIM}, {kv(2, "k"), kd::KV_DIM}, {kv(2, "v"), kd::KV_DIM}});
   }
   for (int l = 0; l < 3; ++l) {
     const std::string p = "layers." + std::to_string(l) + ".";
@@ -324,8 +331,8 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     L.k_norm_ctx = persist({{a + "k_norm_ctx.weight", {kd::HEAD_DIM}}});
     L.qkv = fp8({{a + "q_proj.weight", kd::Q_DIM}, {a + "k_proj.weight", kd::KV_DIM}, {a + "v_proj.weight", kd::KV_DIM}});
     L.gate_up = fp8({{p + "mlp.gate_proj.weight", I}, {p + "mlp.up_proj.weight", I}});
-    L.wo = persist({{a + "o_proj.weight", {h, kd::Q_DIM}}});
-    L.w_down = persist({{p + "mlp.down_proj.weight", {h, I}}});
+    L.wo = fp8({{a + "o_proj.weight", h}}, kd::Q_DIM);
+    L.w_down = fp8({{p + "mlp.down_proj.weight", h}}, I);
   }
   final_norm_ = persist({{"norm.weight", {h}}});
   mask_embed_ = persist({{"mask_embed", {h}}});
@@ -436,7 +443,7 @@ constexpr std::size_t LOCAL_BYTES = std::size_t(kd::WINDOW) * kd::KV_DIM * 2;
 
 std::size_t Drafter::checkpoint_bytes() const {
   return 4 * LOCAL_BYTES + 2 * kd::WINDOW * sizeof(std::int32_t) + std::size_t(H) * 2 +
-         2 * std::size_t(ctx_) * kd::KV_DIM * 2;
+         2 * ctx_ * GLOBAL_SLOT_BYTES;
 }
 
 void Drafter::save_checkpoint(void* dst) {
@@ -456,9 +463,9 @@ void Drafter::save_checkpoint(void* dst) {
   }
   copy(off, f_rnn_, std::size_t(H) * 2);
   off += std::size_t(H) * 2;
-  const std::size_t live = std::size_t(std::min(length_, ctx_)) * kd::KV_DIM * 2;
+  const std::size_t live = std::size_t(std::min(length_, ctx_)) * GLOBAL_SLOT_BYTES;
   copy(off, layers_[1].k_ctx, live);
-  copy(off + std::size_t(ctx_) * kd::KV_DIM * 2, layers_[1].v_ctx, live);
+  copy(off + ctx_ * GLOBAL_SLOT_BYTES, layers_[1].v_ctx, live);
   checkpoint_ = dst;
   checkpoint_length_ = length_;
   checkpoint_clobbered_ = false;
@@ -479,8 +486,8 @@ void Drafter::restore_copy(const void* src, int length, const std::vector<std::i
 
 std::vector<std::pair<std::size_t, std::size_t>> Drafter::checkpoint_spans(int length) const {
   const std::size_t fixed = 4 * LOCAL_BYTES + 2 * kd::WINDOW * sizeof(std::int32_t) + std::size_t(H) * 2;
-  const std::size_t live = std::size_t(std::min(length, ctx_)) * kd::KV_DIM * 2;
-  const std::size_t ring = std::size_t(ctx_) * kd::KV_DIM * 2;
+  const std::size_t live = std::size_t(std::min(length, ctx_)) * GLOBAL_SLOT_BYTES;
+  const std::size_t ring = ctx_ * GLOBAL_SLOT_BYTES;
   return {{0, fixed}, {fixed, live}, {fixed + ring, live}};
 }
 
@@ -504,9 +511,9 @@ void Drafter::restore_from(const void* src, int length, const std::vector<std::i
   copy(f_rnn_, off, std::size_t(H) * 2);
   off += std::size_t(H) * 2;
   if (global_slots) {
-    const std::size_t live = std::size_t(std::min(length, ctx_)) * kd::KV_DIM * 2;
+    const std::size_t live = std::size_t(std::min(length, ctx_)) * GLOBAL_SLOT_BYTES;
     copy(layers_[1].k_ctx, off, live);
-    copy(layers_[1].v_ctx, off + std::size_t(ctx_) * kd::KV_DIM * 2, live);
+    copy(layers_[1].v_ctx, off + ctx_ * GLOBAL_SLOT_BYTES, live);
   }
   length_ = length;
   // the context tokens of the checkpoint: drop the ones added since (rebuild if they were reset meanwhile)
@@ -521,8 +528,8 @@ void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);
     gemm_.run(ctx_c_, n, L.wkv_ctx, 2 * kd::KV_DIM, H, ctx_kv_, stream_);
     const int size = is_local(l) ? kd::WINDOW : ctx_;
-    kd::ctx_kv_store(ctx_kv_, n, params_, row0, n - std::min(n, size), L.k_norm_ctx, L.k_ctx, L.v_ctx, size,
-                     L.ctx_pos, stream_);
+    kd::ctx_kv_store(ctx_kv_, n, params_, row0, n - std::min(n, size), L.k_norm_ctx, L.k_ctx, L.v_ctx,
+                     !is_local(l) && GLOBAL_FP8, size, L.ctx_pos, stream_);
   }
   if (last_piece) kd::mix_rmsnorm(feats + std::size_t(n - 1) * 4 * H, 1, alpha_ + 12, f_norm_, f_rnn_, stream_);
 }
@@ -560,24 +567,29 @@ void Drafter::run_small_commit() {
 void Drafter::run_draft(int bucket) {
   kd::embed_block(static_cast<const __nv_bfloat16*>(w_.embed.data), static_cast<const float*>(w_.embed_norm.data),
                   mask_embed_, layers_[0].in_norm, params_, res_, xn_, picks_, stream_);
+  run_layers(bucket);
+}
+
+// the draft after the block's input rows (res_, xn_)
+void Drafter::run_layers(int bucket) {
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
     const bool local = is_local(l);
     kdense::proj(xn_, BLOCK, L.qkv, seg_qkv_, 1, qkv_out_, true, stream_);
-    kd::qkv_rope(qkv_out_, L.q_norm, L.k_norm, params_, q_, L.k_ctx, L.v_ctx, local, ctx_, stream_);
-    kd::block_attention(q_, L.k_ctx, L.v_ctx, local ? LOCAL_SLOTS : bucket, L.ctx_pos, params_, attn_ws_, attn_o_,
-                        stream_);
-    kdense::gemv(attn_o_, BLOCK, kd::Q_DIM, kdense::Matrix{L.wo, nullptr, H}, delta_, true, stream_);
+    kd::qkv_rope(qkv_out_, L.q_norm, L.k_norm, params_, q_, L.k_ctx, L.v_ctx, !local && GLOBAL_FP8, local, ctx_,
+                 stream_);
+    kd::block_attention(q_, L.k_ctx, L.v_ctx, local ? LOCAL_SLOTS : bucket, L.ctx_pos, !local && GLOBAL_FP8, params_,
+                        attn_ws_, attn_o_, stream_);
+    kdense::gemv(attn_o_, BLOCK, kd::Q_DIM, L.wo, delta_, true, stream_);
     kd::add_rmsnorm(res_, delta_, L.post_norm, xn_, BLOCK, stream_);
     kdense::proj(xn_, BLOCK, L.gate_up, seg_gate_up_, 1, gu_out_, true, stream_);
     kd::silu_mul(gu_out_, BLOCK, inter_, act_, stream_);
-    kdense::gemv(act_, BLOCK, inter_, kdense::Matrix{L.w_down, nullptr, H}, delta_, true, stream_);
+    kdense::gemv(act_, BLOCK, inter_, L.w_down, delta_, true, stream_);
     kd::add_rmsnorm(res_, delta_, l < 2 ? layers_[l + 1].in_norm : final_norm_, xn_, BLOCK, stream_);
   }
   const __nv_bfloat16* h = xn_ + H;  // rows 1..7
   kdense::proj(h, GAMMA, short_head_, seg_short_, 1, base_, true, stream_);
-  kd::topk_candidates(base_, GAMMA, short_head_.rows, cand_val_, cand_idx_, topk_ws_, stream_);
-  kd::map_candidates(cand_idx_, GAMMA * kd::CANDIDATES, short_map_, stream_);
+  kd::topk_candidates(base_, GAMMA, short_head_.rows, short_map_, cand_val_, cand_idx_, topk_ws_, stream_);
   kd::markov_pre(rnn_w_, h, f_rnn_, part_, stream_);
   for (int i = 0; i < GAMMA; ++i) {
     kd::markov_step(i, rnn_w_, rnn_b_, w1_, part_, picks_, cand_idx_, params_, state_, latent_, stream_);
@@ -606,11 +618,15 @@ Drafter::Draft Drafter::draft(int anchor, int P, float temperature) {
   return {tokens_, draft_logits_, conf_, qstats_};
 }
 
-// set_round + small commit + draft, all reading device values
+// the round's parameters, the small commit and the draft, all from device values: the commit's input mix and
+// the block's input rows share the first launch
 void Drafter::run_advance(int bucket) {
-  kd::set_round(params_, round_, stream_);
-  run_small_commit();
-  run_draft(bucket);
+  kd::round_begin(params_, round_, alpha_, ctx_layers_, f_norm_, static_cast<const __nv_bfloat16*>(w_.embed.data),
+                  static_cast<const float*>(w_.embed_norm.data), mask_embed_, layers_[0].in_norm, commit_xin_, f_rnn_,
+                  res_, xn_, picks_, stream_);
+  kdense::proj(commit_xin_, BLOCK, wkv_all_, seg_kv_, 3, commit_kv_, true, stream_);
+  kd::commit_store(commit_kv_, params_, ctx_layers_, stream_);
+  run_layers(bucket);
 }
 
 void Drafter::bind_round(const kd::RoundInputs& in) {

@@ -12,29 +12,37 @@ namespace {
 // ---- top-k candidates ----------------------------------------------------------------------------------
 // The values are BF16-representable, so the upper 16 bits of their order key decide the order. A two-level
 // 8-bit radix select over TOPK_SLICES CTAs per row finds the 1024th key T16; every element above it is a
-// candidate, and of the elements equal to it the lowest indices fill the rest (ties in index order across
-// slices: each slice knows how many ties the slices before it hold). The 1024 candidates are then sorted by
-// (value descending, index ascending), which makes the result independent of the order they were gathered.
+// candidate, and of the elements equal to it the lowest indices fill the rest. The candidates come out in a
+// fixed order that needs no sort: the elements above T16 by ascending index, then the ties by ascending
+// index (the Markov head only needs the order to be reproducible).
 //   hist_hi: per-slice histograms of the high byte
 //   hist_lo: the high byte b1 holding the 1024th key (every CTA sums the slice histograms), then per-slice
 //            histograms of the low byte of the keys in bin b1
-//   count:   T16, the count above it and the ties needed; per-slice counts of keys above T16 and equal to it
-//   scatter: each slice writes its keys above T16 and its needed ties at their offsets
-//   sort:    bitonic sort of the 1024 candidates per row
+//   collect: T16; each slice compacts its elements above T16 and its first ties, in index order, into its
+//            own part of the workspace and records the two counts
+//   gather:  candidate j looks its element up through the prefix sums of the slice counts (and maps it to a
+//            token id)
 
 constexpr int TOPK_SLICES = 32;
 constexpr int TOPK_THREADS = 256;
-constexpr int SORT_THREADS = 1024;
-static_assert(CANDIDATES == SORT_THREADS);
+constexpr int GATHER_THREADS = 1024;
+static_assert(CANDIDATES == GATHER_THREADS && TOPK_SLICES == 32);
+
+struct TopkItem {
+  float val;
+  std::int32_t idx;
+};
 
 // Per-row workspace. The total histograms are accumulated with integer atomics (exact, order independent)
-// and cleared again by the sort kernel, so the workspace must start zeroed and stays so between calls.
+// and cleared again by the gather kernel, so the workspace must start zeroed and stays so between calls
+// (the item lists and counts are rewritten by every call).
 struct TopkRowWs {
   uint32_t total_hi[256];
   uint32_t total_lo[256];
   int count_gt[TOPK_SLICES];
-  int count_tie[TOPK_SLICES];
-  unsigned long long items[CANDIDATES];
+  int count_tie[TOPK_SLICES];  // at most CANDIDATES
+  TopkItem above[TOPK_SLICES][CANDIDATES];
+  TopkItem ties[TOPK_SLICES][CANDIDATES];
 };
 
 __device__ __forceinline__ uint32_t key16(float v) { return float_key(v) >> 16; }
@@ -126,56 +134,20 @@ __device__ __forceinline__ void select_threshold(const TopkRowWs& w, uint32_t& T
   n_gt = *sh_above;
 }
 
-__global__ void __launch_bounds__(TOPK_THREADS) topk_count_kernel(const float* base, int V, TopkRowWs* ws) {
+__global__ void __launch_bounds__(TOPK_THREADS) topk_collect_kernel(const float* base, int V, TopkRowWs* ws) {
   __shared__ int sh_bin, sh_above, warp_tot[TOPK_THREADS / 32];
-  __shared__ int n_above, n_tie;
+  __shared__ uint32_t warp_cnt[TOPK_THREADS / 32];
   pdl_trigger();
-  if (threadIdx.x == 0) n_above = n_tie = 0;
-  pdl_wait();
-  const int s = blockIdx.x, row = blockIdx.y;
-  TopkRowWs& w = ws[row];
-  uint32_t T;
-  int n_gt;
-  select_threshold(w, T, n_gt, &sh_bin, &sh_above, warp_tot);
-  const float* x = base + size_t(row) * V;
-  int b, e;
-  slice_range(V, s, b, e);
-  int gt = 0, tie = 0;
-  for (int i = b + threadIdx.x; i < e; i += TOPK_THREADS) {
-    const uint32_t k = key16(x[i]);
-    gt += k > T;
-    tie += k == T;
-  }
-  atomicAdd(&n_above, gt);
-  atomicAdd(&n_tie, tie);
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    w.count_gt[s] = n_above;
-    w.count_tie[s] = n_tie;
-  }
-}
-
-__global__ void __launch_bounds__(TOPK_THREADS) topk_scatter_kernel(const float* base, int V, TopkRowWs* ws) {
-  __shared__ int sh_bin, sh_above, warp_tot[TOPK_THREADS / 32];
-  __shared__ int sh_gt, warp_ties[TOPK_THREADS / 32];
-  pdl_trigger();
-  if (threadIdx.x == 0) sh_gt = 0;
   pdl_wait();
   const int s = blockIdx.x, row = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   TopkRowWs& w = ws[row];
   uint32_t T;
   int n_gt;
   select_threshold(w, T, n_gt, &sh_bin, &sh_above, warp_tot);
-  const int need = CANDIDATES - n_gt;
-  int gt_off = 0, tie_off = 0;
-  for (int t = 0; t < s; ++t) {
-    gt_off += w.count_gt[t];
-    tie_off += w.count_tie[t];
-  }
   const float* x = base + size_t(row) * V;
   int b, e;
   slice_range(V, s, b, e);
-  const bool want_ties = tie_off < need && w.count_tie[s] > 0;
+  int n_above = 0, n_tie = 0;  // of the slice so far (block-uniform)
   for (int i0 = b; i0 < e; i0 += TOPK_THREADS) {
     const int i = i0 + threadIdx.x;
     float v = 0.f;
@@ -184,56 +156,70 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_scatter_kernel(const float*
       v = x[i];
       k = key16(v);
     }
-    if (i < e && k > T) w.items[gt_off + atomicAdd(&sh_gt, 1)] = pack_argmax(v, uint32_t(i));
-    if (want_ties) {  // block-uniform
-      const bool tie = i < e && k == T;
-      const unsigned ballot = __ballot_sync(0xffffffffu, tie);
-      if (lane == 0) warp_ties[warp] = __popc(ballot);
-      __syncthreads();
-      int rank = tie_off + __popc(ballot & ((1u << lane) - 1u));
-      int total = 0;
-      for (int t = 0; t < TOPK_THREADS / 32; ++t) {
-        if (t < warp) rank += warp_ties[t];
-        total += warp_ties[t];
+    const bool gt = i < e && k > T, tie = i < e && k == T;
+    const unsigned bg = __ballot_sync(0xffffffffu, gt), bt = __ballot_sync(0xffffffffu, tie);
+    if (lane == 0) warp_cnt[warp] = uint32_t(__popc(bg)) | (uint32_t(__popc(bt)) << 16);
+    __syncthreads();
+    int rg = n_above + __popc(bg & ((1u << lane) - 1u)), rt = n_tie + __popc(bt & ((1u << lane) - 1u));
+#pragma unroll
+    for (int u = 0; u < TOPK_THREADS / 32; ++u) {
+      const uint32_t c = warp_cnt[u];
+      if (u < warp) {
+        rg += int(c & 0xffffu);
+        rt += int(c >> 16);
       }
-      if (tie && rank < need) w.items[n_gt + rank] = pack_argmax(v, uint32_t(i));
-      tie_off += total;
-      __syncthreads();
+      n_above += int(c & 0xffffu);
+      n_tie += int(c >> 16);
     }
+    if (gt) w.above[s][rg] = TopkItem{v, i};
+    if (tie && rt < CANDIDATES) w.ties[s][rt] = TopkItem{v, i};
+    __syncthreads();  // warp_cnt is rewritten by the next round
+  }
+  if (threadIdx.x == 0) {
+    w.count_gt[s] = n_above;
+    w.count_tie[s] = min(n_tie, CANDIDATES);
   }
 }
 
-__global__ void __launch_bounds__(SORT_THREADS) topk_sort_kernel(TopkRowWs* ws, float* cand_val,
-                                                                 std::int32_t* cand_idx) {
-  __shared__ unsigned long long items[CANDIDATES];
+// CTA per row, thread per candidate. map: element index -> token id, or null.
+__global__ void __launch_bounds__(GATHER_THREADS) topk_gather_kernel(TopkRowWs* ws, const std::int32_t* map,
+                                                                     float* cand_val, std::int32_t* cand_idx) {
+  __shared__ int pre_gt[TOPK_SLICES + 1], pre_tie[TOPK_SLICES + 1];
   pdl_trigger();
   pdl_wait();
   const int tid = threadIdx.x;
-  items[tid] = ws[blockIdx.x].items[tid];
+  TopkRowWs& w = ws[blockIdx.x];
+  if (tid < TOPK_SLICES) {  // warp 0: prefix sums of the slice counts
+    int cg = w.count_gt[tid], ct = w.count_tie[tid];
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int ug = __shfl_up_sync(0xffffffffu, cg, o), ut = __shfl_up_sync(0xffffffffu, ct, o);
+      if (tid >= o) {
+        cg += ug;
+        ct += ut;
+      }
+    }
+    pre_gt[tid + 1] = cg;
+    pre_tie[tid + 1] = ct;
+    if (tid == 0) pre_gt[0] = pre_tie[0] = 0;
+  }
   if (tid < 256) {  // every reader of the totals completed (pdl_wait): leave them zeroed for the next call
-    ws[blockIdx.x].total_hi[tid] = 0;
-    ws[blockIdx.x].total_lo[tid] = 0;
+    w.total_hi[tid] = 0;
+    w.total_lo[tid] = 0;
   }
   __syncthreads();
-  // bitonic sort, descending
-  for (int k = 2; k <= CANDIDATES; k <<= 1) {
-    for (int j = k >> 1; j > 0; j >>= 1) {
-      const int ixj = tid ^ j;
-      if (ixj > tid) {
-        const unsigned long long a = items[tid], b = items[ixj];
-        const bool desc = (tid & k) == 0;
-        if (desc ? a < b : a > b) {
-          items[tid] = b;
-          items[ixj] = a;
-        }
-      }
-      __syncthreads();
-    }
-  }
-  const unsigned long long it = items[tid];
+  const int n_gt = pre_gt[TOPK_SLICES];
+  const bool above = tid < n_gt;
+  const int* pre = above ? pre_gt : pre_tie;
+  const int j = above ? tid : tid - n_gt;
+  int s = 0;  // the slice holding element j of the list: the last one with pre[s] <= j
+#pragma unroll
+  for (int step = TOPK_SLICES / 2; step > 0; step >>= 1)
+    if (pre[s + step] <= j) s += step;
+  const TopkItem it = above ? w.above[s][j - pre[s]] : w.ties[s][j - pre[s]];
   const size_t at = size_t(blockIdx.x) * CANDIDATES + tid;
-  cand_val[at] = key_float(static_cast<uint32_t>(it >> 32));
-  cand_idx[at] = std::int32_t(unpack_argmax_index(it));
+  cand_val[at] = it.val;
+  cand_idx[at] = map != nullptr ? map[it.idx] : it.idx;
 }
 
 // ---- rnn projection ------------------------------------------------------------------------------------
@@ -405,15 +391,11 @@ __global__ void __launch_bounds__(CANDIDATES) markov_finish_kernel(const std::in
     qstats[2 * i] = qm;
     qstats[2 * i + 1] = qs;
     tokens[i] = cand_idx[i * CANDIDATES + int(unpack_argmax_index(picks[i]))];
-    if (i == 0) p->draws += 1;
+    if (i == 0) {
+      p->draws += 1;
+      p->round_start = p->P;  // a round transition commits at this draft's position
+    }
   }
-}
-
-__global__ void map_candidates_kernel(std::int32_t* cand_idx, int n, const std::int32_t* map) {
-  pdl_trigger();
-  pdl_wait();
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) cand_idx[i] = map[cand_idx[i]];
 }
 
 // block per row
@@ -431,10 +413,6 @@ __global__ void gather_head_rows_kernel(const uint4* __restrict__ src, const flo
 
 }  // namespace
 
-void map_candidates(std::int32_t* cand_idx, int n, const std::int32_t* map, cudaStream_t stream) {
-  launch_pdl(map_candidates_kernel, dim3((n + 255) / 256), dim3(256), stream, cand_idx, n, map);
-}
-
 void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
                       void* dst, float* dst_scale, std::int32_t* map, cudaStream_t stream) {
   if (row_bytes % 16 != 0) throw std::invalid_argument("gather_head_rows: rows must be 16-byte multiples");
@@ -449,18 +427,16 @@ std::size_t topk_workspace_bytes(int rows, int V) {
   return std::size_t(rows) * sizeof(TopkRowWs);
 }
 
-void topk_candidates(const float* base, int rows, int V, float* cand_val, std::int32_t* cand_idx, void* ws,
-                     cudaStream_t stream) {
+void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
+                     std::int32_t* cand_idx, void* ws, cudaStream_t stream) {
   if (V < CANDIDATES) throw std::invalid_argument("topk_candidates: V must be at least 1024");
   if (rows <= 0) return;
   auto* w = static_cast<TopkRowWs*>(ws);
   const dim3 grid(TOPK_SLICES, rows);
   launch_pdl(topk_hist_hi_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
   launch_pdl(topk_hist_lo_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
-  launch_pdl(topk_count_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
-  launch_pdl(topk_scatter_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
-  launch_pdl(topk_sort_kernel, dim3(rows), dim3(SORT_THREADS), stream, w, cand_val,
-             cand_idx);
+  launch_pdl(topk_collect_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
+  launch_pdl(topk_gather_kernel, dim3(rows), dim3(GATHER_THREADS), stream, w, map, cand_val, cand_idx);
 }
 
 void markov_pre(const __nv_bfloat16* rnn_w, const __nv_bfloat16* h, const __nv_bfloat16* f_rnn, float* part,
