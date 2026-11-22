@@ -35,6 +35,18 @@ When another chat displaces a prompt of at least 2,048 tokens, the server can sa
 
 The verification kernels and full-row checkpoint copies are adapted from satellitedown's original engine. [Narrow verification](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/ac5f704e176b387ea8c1d377b332887a2344e722) · [FP8 attention](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/866e908c9f0eaefb238ddcd205349ac026a77bed) · [Conversation parking](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine/commit/8210872574b9607f59639da49bb483faf5b37523)
 
+| Workload | Published `rtx4090` | Performance branch |
+|---|---:|---:|
+| First token, 33,018 fresh tokens | 3.23 s | 3.04 s |
+| First token, 251,504 fresh tokens | 35.27 s | 33.89 s |
+| Fixed-output decode, 2,914 timed tokens across eight workloads | 271.1 tok/s | 275.0 tok/s |
+| Fixed-output decode after 130,351 input tokens, 194 timed tokens | 226.2 tok/s | 233.1 tok/s |
+| First token on return to the same 251,529-token chat after another chat | 35.33 s | 0.19 s |
+
+On that first switch, the intervening short request took 1.67 s on the branch versus 43 ms on the published build. Repeating the switch with the reusable host allocation took 0.21 s to leave and 0.19 s to return. The final launcher also retrieved all three codes from 261,145 fresh tokens in 35.84 s to first output. After loading, the desktop had 629 MiB of free VRAM. The cold-chat numbers are individual requests. Both decode comparisons replay identical output IDs across engines.
+
+Using 4,096-token chunks, the speculative fidelity check recorded 3 of 12,000 emitted tokens more than 0.5 logits below the width-one greedy argmax (2.50 per 10,000, limit 15). The maximum gap was 1.4407. Kernel selection and chunking can change floating-point rounding and generated text.
+
 ## Published baseline measurements
 
 Measured on one RTX 4090, a Ryzen 9 7950X3D and CUDA 13.5. Each server was already loaded. Time to first token includes reasoning. Cold documents contained three passcodes placed at 2%, 50% and 96% depth. The supplied ablation was active.
