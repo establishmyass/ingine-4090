@@ -329,7 +329,7 @@ class EngineGenerator final : public Generator {
       if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       const RowOverride rows = image_rows(images, int(s), T);
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr, rows.n ? &rows : nullptr);
+                     drafter_ ? &taps : nullptr, rows.n ? &rows : nullptr, s == 0 || s - start >= WINDOW);
       if (drafter_) {
         drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
         drafter_->commit(taps, int(s));

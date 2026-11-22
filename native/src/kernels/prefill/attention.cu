@@ -37,6 +37,20 @@ constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kLn2 = 0.6931471805599453f;
 constexpr float kPScale = 32768.f, kPUnscale = 1.f / 32768.f;
 
+// Subnormal probabilities round to zero in the FP16 value product. Their total at 262K is below
+// 4e-33 alongside a unit maximum in the FP32 softmax sum. Keep the running-max rescale in FP32.
+template <bool FullFp8>
+__device__ __forceinline__ float probability(float x) {
+#if __CUDA_ARCH__ == 890
+  if constexpr (FullFp8) {
+    float p;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(p) : "f"(x));
+    return p;
+  }
+#endif
+  return exp2f(x);
+}
+
 struct Smem {
   uint16_t k[2][BK * D];  // BF16 keys, swizzled [64][16 chunks]
   uint16_t v[2][BK * D];  // FP16 values
@@ -324,7 +338,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     for (int nt = 0; nt < BK / 8; ++nt) {
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        const float pv = exp2f(sc[nt][e] - mref[e >> 1]);
+        const float pv = probability<FP8 && !EXPLICIT>(sc[nt][e] - mref[e >> 1]);
         l[e >> 1] += pv;
         sc[nt][e] = pv * kPScale;
       }

@@ -64,23 +64,27 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   xin_ = bf16(3 * C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
   mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
   proj_ = bf16(C * PROJ_ROWS_FULL);
-  q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL), rel_ = bf16(C * HEADS * REL_EXTENT);
+  // Q and the relative features replace the projection inputs after their last GEMM.
+  static_assert(HEADS * (HEAD_DIM + D_REL) <= 3 * HIDDEN);
+  q_ = xin_, rel16_ = q_ + C * HEADS * HEAD_DIM;
+  rel_ = bf16(C * HEADS * REL_EXTENT);
   krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
-  attn_out_ = bf16(C * HEADS * HEAD_DIM), wo_out_ = bf16(C * H);
+  // mixf_ is dead after the attention gates. Attention output and then expert activations reuse it.
+  static_assert(HEADS * HEAD_DIM <= 6 * HIDDEN && TOP_K * INTER <= 6 * HIDDEN);
+  attn_out_ = reinterpret_cast<__nv_bfloat16*>(mixf_), wo_out_ = bf16(C * H);
   g16_ = bf16(C * GATE_RANK);
-  // message-gate scratch lives in buffers dead while the gates run: gin_ in rel_ (written by rel_logits after
-  // the attention-side gates, dead before the MLP-side gate), fpre_/gpre_ in down_ (written by the experts after
-  // both gates)
-  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && 2 * HIDDEN * 4 <= TOP_K * HIDDEN * 2);
+  // Gates and expert down-projection run outside attention. The gate inputs and both FP32 gate
+  // projections fit together in the BF16 relative-logit slab.
+  static_assert((3 * 2 + 2 * 2) * HIDDEN <= HEADS * REL_EXTENT && TOP_K * HIDDEN <= HEADS * REL_EXTENT);
   router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
   idx_ = i32(C * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_max_tiles(max_chunk)) * sizeof(int4)));
-  act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
+  act_ = attn_out_, down_ = rel_, moe_sum_ = wo_out_;
   gin_ = rel_;
-  fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
+  fpre_ = reinterpret_cast<float*>(rel_ + C * 3 * 2 * H), gpre_ = fpre_ + C * H;
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
@@ -105,7 +109,7 @@ const float* const* Prefiller::block_table(const std::vector<const float*>& bloc
 }
 
 void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
-                    const RowOverride* override_rows) {
+                    const RowOverride* override_rows, bool contiguous_window) {
   if (T < 1 || T > max_chunk_) throw std::invalid_argument("Prefiller::run: T outside 1..max_chunk");
   if (pos0 < 0 || pos0 + T > st.max_ctx)
     throw std::invalid_argument("context " + std::to_string(pos0 + T) + " exceeds max_ctx " +
@@ -265,13 +269,21 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       auto* v_ring = static_cast<__nv_bfloat16*>(st.v_ring_at(ri).data);
       std::int64_t* ring_pos = st.ring_pos_at(ri);
       // keys = cat(ring, chunk) as model.prefill reads them, before the ring takes the chunk's last rows
-      pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s);
+      if (!contiguous_window || pos0 != 0)
+        pk::ring_gather(k_ring, v_ring, ring_pos, pos0, T, krows_, vrows_, kpos_, kpos_rows_, s);
       ap.k_out = krows_ + std::size_t(WINDOW) * KV_DIM, ap.v_out = vrows_ + std::size_t(WINDOW) * KV_DIM;
       ap.out_fp8 = false;
       pk::attn_prep(ap, s);
       pk::ring_update(krows_, vrows_, pos0, T, k_ring, v_ring, ring_pos, s);
-      pk::key_tile_bounds(kpos_, WINDOW + T, bounds_, s);
-      at.k = krows_, at.v = vrows_, at.kv_fp8 = false, at.kpos = kpos_, at.bounds = bounds_, at.L = WINDOW + T;
+      if (contiguous_window) {
+        // The rotated ring is already chronological. Relative bias and the causal mask only use differences.
+        const int prefix = pos0 == 0 ? 0 : WINDOW;
+        const std::size_t skip = std::size_t(WINDOW - prefix) * KV_DIM;
+        at.k = krows_ + skip, at.v = vrows_ + skip, at.pos0 = prefix, at.L = prefix + T;
+      } else {
+        pk::key_tile_bounds(kpos_, WINDOW + T, bounds_, s);
+        at.k = krows_, at.v = vrows_, at.kpos = kpos_, at.bounds = bounds_, at.L = WINDOW + T;
+      }
       at.window = WINDOW;
     }
     pk::conv_state_update(st.conv_k_at(v), proj_ + SEG_BEGIN[SEG_K], R, T, KV_DIM, s);

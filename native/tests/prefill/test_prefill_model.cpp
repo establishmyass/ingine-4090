@@ -97,12 +97,12 @@ int main(int argc, char** argv) {
   INGINE_TEST_CUDA(cudaMemcpy(d_ids, ids.data(), N * 4, cudaMemcpyHostToDevice));
   State& st = rt.state();
 
-  auto prefill = [&](int upto, int chunk, std::vector<uint16_t>* last_taps) {
+  auto prefill = [&](int upto, int chunk, std::vector<uint16_t>* last_taps, bool implicit = false) {
     reset_state(st, s);
     for (int p0 = 0; p0 < upto; p0 += chunk) {
       const int T = std::min(chunk, upto - p0);
       Tensor taps = rm(d_taps, DType::BF16, {T, NUM_TAPS, HIDDEN});
-      pre.run(st, d_ids + p0, T, p0, d_logits, last_taps ? &taps : nullptr);
+      pre.run(st, d_ids + p0, T, p0, d_logits, last_taps ? &taps : nullptr, nullptr, implicit && (p0 == 0 || p0 >= WINDOW));
       if (last_taps && p0 + T == upto) {
         last_taps->resize(size_t(NUM_TAPS) * HIDDEN);
         INGINE_TEST_CUDA(cudaMemcpyAsync(last_taps->data(), d_taps + size_t(T - 1) * NUM_TAPS * HIDDEN,
@@ -117,6 +117,11 @@ int main(int argc, char** argv) {
   bool ok = true;
   std::vector<uint16_t> taps_a;
   const auto a = prefill(N, 2048, &taps_a);
+  std::vector<uint16_t> implicit_taps;
+  const auto implicit_logits = prefill(N, 2048, &implicit_taps, true);
+  const bool same = a == implicit_logits && taps_a == implicit_taps;
+  std::printf("%s contiguous sliding window matches explicit positions\n", same ? "PASS" : "FAIL");
+  ok &= same;
   const auto b = prefill(N, 700, nullptr);
   ok &= compare("chunks 2048+952 vs 700s", a, b, 1e-2);
 

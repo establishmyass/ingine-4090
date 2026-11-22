@@ -42,8 +42,9 @@ class Prefiller {
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
 
+  // contiguous_window: the sliding rings are empty at zero or hold the preceding WINDOW rows in order.
   void run(State& state, const std::int32_t* tokens, int T, int pos0, float* logits, Tensor* taps,
-           const RowOverride* override_rows = nullptr);
+           const RowOverride* override_rows = nullptr, bool contiguous_window = false);
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object
