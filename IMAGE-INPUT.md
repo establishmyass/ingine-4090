@@ -6,7 +6,7 @@ beyond a 9 MiB staging buffer. The image embeddings replace the image placeholde
 prefill. Nothing to download or configure: the tower is read from the model folder when the server starts.
 
 ```bash
-curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' -d '{
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages": [{"role": "user", "content": [
     {"type": "text", "text": "What is in this picture?"},
     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 -w0 photo.jpg)"'"}}]}],

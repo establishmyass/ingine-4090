@@ -1,15 +1,18 @@
 # ingine on one RTX 4090
 
-This local Linux port serves Inkling 2 Mini through a native C++/CUDA engine built for **SM89**. On the test machine all routed experts, the target KV cache, and the DSpark drafter fit on one **24 GB RTX 4090 at 262,144 total context tokens**. The optional image encoder runs on the CPU.
+This Linux port serves Inkling 2 Mini through a native C++/CUDA engine built for **SM89**. On the test machine all routed experts, the target KV cache, and the DSpark drafter fit on one **24 GB RTX 4090 at 262,144 total context tokens**. The optional image encoder runs on the CPU.
 
-## Run the local checkout
+## Install and run
 
 ```bash
-cd /home/me/Developments/ingine-4090
-./scripts/ingine serve
+git clone https://github.com/establishmyass/ingine-4090.git
+cd ingine-4090
+bash setup.sh
 ```
 
-Use an **OpenAI-compatible** client with base URL `http://127.0.0.1:8003/v1` and model ID `inkling-2-mini-abliterated`. Stop a foreground server with **Ctrl-C**. For background use, run `./scripts/ingine start`, `./scripts/ingine status` and `./scripts/ingine stop`. The server accepts one request at a time, serves chat, reasoning, streaming, base64 images and tools, and defaults to loopback with no authentication.
+Choose option 1 to build the engine and download the model. After setup, run `./scripts/ingine serve` for the abliterated model or `INGINE_ABLATION= ./scripts/ingine serve` for the original.
+
+Use an **OpenAI-compatible** client with base URL `http://127.0.0.1:8080/v1` and model ID `inkling-2-mini-abliterated`. Stop a foreground server with **Ctrl-C**. For background use, run `./scripts/ingine start`, `./scripts/ingine status` and `./scripts/ingine stop`. The server accepts one request at a time, serves chat, reasoning, streaming, base64 images and tools, and defaults to loopback with no authentication.
 
 | Setting | Local default |
 |---|---|
@@ -21,7 +24,7 @@ Use an **OpenAI-compatible** client with base URL `http://127.0.0.1:8003/v1` and
 | Prefill chunk | 2,048 tokens |
 | Images | CPU vision tower, AVX-512 BF16 capable CPU |
 
-The binary and verified weights are already present in this checkout. `INGINE_ABLATION= ./scripts/ingine serve` serves the original target instead, as `inkling-2-mini`. `PORT`, `HOST`, `INGINE_MODEL_DIR` and `INGINE_CTX` override the local settings. Stop other model servers before using the full window. For example, `INGINE_CTX=65536 ./scripts/ingine serve` frees memory on a busier desktop. On CPUs supporting the expert offload path, `./scripts/ingine serve --offload-experts 4` is a lower-VRAM option.
+The original model is served as `inkling-2-mini`. `PORT`, `HOST`, `INGINE_MODEL_DIR` and `INGINE_CTX` override the local settings. Stop other model servers before using the full window. For example, `INGINE_CTX=65536 ./scripts/ingine serve` frees memory on a busier desktop. On CPUs supporting the expert offload path, `./scripts/ingine serve --offload-experts 4` is a lower-VRAM option.
 
 ## Measurements
 

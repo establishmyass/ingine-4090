@@ -75,7 +75,7 @@ static const auto g_process_start = std::chrono::steady_clock::now();
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0;
+  int port = 8080, max_ctx = 65536, max_queue = 4, max_model_len = 0;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false;
   double spec_threshold = 0.8, fake_delay = 0.02;
   double offload_experts = 0.0;

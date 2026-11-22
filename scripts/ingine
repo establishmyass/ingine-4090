@@ -42,7 +42,7 @@ Settings: environment variables, or shell assignments in $CONFIG (the environmen
   INGINE_MODEL_DIR      model folder (default \$ROOT/models/Inkling-2-Mini)
   INGINE_ABLATION       ablation file (default <model folder>/inkling-2-mini-abliterated.safetensors, downloaded
                         with the model); set it empty (INGINE_ABLATION=) to serve the original model as inkling-2-mini
-  HOST, PORT            bind address (default 127.0.0.1, 8003)
+  HOST, PORT            bind address (default 127.0.0.1, 8080)
   INGINE_CTX            context length in tokens (default 262144)
   INGINE_EXTRA_ARGS     extra server flags, split on whitespace (e.g. "--spec-threshold 0.7")
   INGINE_START_TIMEOUT  seconds start waits for /health (default 300)

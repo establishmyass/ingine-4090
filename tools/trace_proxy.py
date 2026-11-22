@@ -261,7 +261,7 @@ def make_handler(upstream, recorder, force_usage, quiet):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--host', default='127.0.0.1')
-    ap.add_argument('--port', type=int, default=8003, help='port to listen on (default 8003: where omp expects ingine)')
+    ap.add_argument('--port', type=int, default=8080, help='port to listen on (default 8080: where omp expects ingine)')
     ap.add_argument('--upstream', default='http://127.0.0.1:8017', help='server the requests are forwarded to')
     ap.add_argument('--trace-dir', default='traces', help='directory for the per-request JSON files')
     ap.add_argument('--tag', default='', help='label appended to the file names of this run (e.g. the scenario)')

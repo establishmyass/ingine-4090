@@ -5,7 +5,7 @@ Runs a fixed set of mild prompts that safety-tuned models commonly over-refuse, 
 completion and whether it looks like a refusal, and can compare two runs (original vs abliterated).
 `--thinking` lets the model reason first (low effort) and judges the final answer.
 
-    tools/refusal_eval.py --base-url http://127.0.0.1:8003/v1 --label original \
+    tools/refusal_eval.py --base-url http://127.0.0.1:8080/v1 --label original \
         --out results/refusals-original.json
     tools/refusal_eval.py --compare results/refusals-original.json results/refusals-abliterated.json
 """
@@ -134,7 +134,7 @@ def compare(a: dict, b: dict) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--base-url', default='http://127.0.0.1:8003/v1')
+    ap.add_argument('--base-url', default='http://127.0.0.1:8080/v1')
     ap.add_argument('--thinking', action='store_true', help='reason first (low effort); judge the final answer')
     ap.add_argument('--label', default='run')
     ap.add_argument('--out')

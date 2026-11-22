@@ -18,7 +18,7 @@ math, decode kernels, CLI flags and HTTP behaviour. Hardware: RTX 5090 class onl
 | `src/text` | `chat.py`: chat rendering (the model's `chat_template.jinja`), reasoning/tool output parsing (`StreamParser`), effort levels |
 | `src/serve`, `src/engine` | `server.py`: `/health`, `/v1/models`, `/v1/chat/completions` (streaming, `reasoning_content`, tools), FIFO scheduler |
 
-The serving profile (262,144 tokens, `--dense-fp8 --kv-fp8 --spec --spec-threshold 0.8`, 127.0.0.1:8003) comes
+The serving profile (262,144 tokens, `--dense-fp8 --kv-fp8 --spec --spec-threshold 0.8`, 127.0.0.1:8080) comes
 from `runtime-manifest.json`.
 
 ## Base: fngine

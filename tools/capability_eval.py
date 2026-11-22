@@ -5,7 +5,7 @@
   * code: Python functions executed against unit tests in a subprocess (thinking off)
   * knowledge: multiple choice (thinking off)
 
-    tools/capability_eval.py --base-url http://127.0.0.1:8003/v1 --label original --out results/cap-original.json
+    tools/capability_eval.py --base-url http://127.0.0.1:8080/v1 --label original --out results/cap-original.json
     tools/capability_eval.py --compare results/cap-reference.json results/cap-abliterated.json
 """
 from __future__ import annotations
@@ -163,7 +163,7 @@ def evaluate(base_url, label):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--base-url', default='http://127.0.0.1:8003/v1')
+    ap.add_argument('--base-url', default='http://127.0.0.1:8080/v1')
     ap.add_argument('--label', default='run')
     ap.add_argument('--out')
     ap.add_argument('--compare', nargs=2)

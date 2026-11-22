@@ -139,7 +139,7 @@ def compare(*runs):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--base-url', default='http://127.0.0.1:8003/v1')
+    ap.add_argument('--base-url', default='http://127.0.0.1:8080/v1')
     ap.add_argument('--label', default='run')
     ap.add_argument('--out')
     ap.add_argument('--gsm8k', type=int, default=40, help='GSM8K problems (each at efforts low and high)')

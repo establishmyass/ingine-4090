@@ -432,7 +432,7 @@ def compare(path_a, path_b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--traces', help='directory of trace files written by tools/trace_proxy.py')
-    ap.add_argument('--base-url', default='http://127.0.0.1:8003/v1')
+    ap.add_argument('--base-url', default='http://127.0.0.1:8080/v1')
     ap.add_argument('--temperature', type=float, help='override the recorded temperature (0: greedy, for A/B)')
     ap.add_argument('--top-p', type=float, help='override the recorded top_p')
     ap.add_argument('--seed', type=int, help='override the recorded seed')

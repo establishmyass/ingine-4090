@@ -144,7 +144,7 @@ download_model() {
 
 next_steps() {
   printf 'Start the server with option 3 (foreground), or with ingine start in the background\n'
-  printf '(option 5 installs the ingine command). API: http://127.0.0.1:8003/v1\n'
+  printf '(option 5 installs the ingine command). API: http://127.0.0.1:8080/v1\n'
 }
 
 install_everything() {
