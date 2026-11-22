@@ -254,6 +254,10 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
 
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    if (err == cudaErrorMemoryAllocation) {
+        cudaGetLastError();  // callers may discard an optional cache and continue
+        throw PinnedHostOutOfMemory(cuda_error_message("cudaMallocHost failed", err));
+    }
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }

@@ -158,6 +158,14 @@ class Runtime {
   void save_checkpoint(void* dst);
   void restore_checkpoint(const void* src);
 
+  // Conversation parking: a checkpoint holds everything but the full-attention caches; save_full_rows copies
+  // their rows [0, n) (k and v of every full visit, positions 0..n-1) to `dst` (device or pinned host memory,
+  // full_rows_bytes(n) long, packed), restore_full_rows puts them back. A checkpoint taken at length n plus
+  // its full rows [0, n) restore the state exactly, whatever ran in between. Stream-ordered.
+  std::size_t full_rows_bytes(int n) const;
+  void save_full_rows(void* dst, int n);
+  void restore_full_rows(const void* src, int n);
+
   // Speculative rollback (engine._generate_spec / _rollback). save_verify before a verify call of m rows at
   // P..P+m-1 saves the conv states and the ring slots (P + i) % WINDOW the call will overwrite;
   // rollback(P, commit, m) after it leaves the state as after its first `commit` rows (no-op if

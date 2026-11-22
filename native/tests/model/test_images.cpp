@@ -91,6 +91,7 @@ int main() {
   opt.dense_fp8 = opt.kv_fp8 = true;
   opt.spec = false;  // plain decoding: bit-exact
   opt.prefill_chunk = 64;
+  opt.park_host_mib = 640;
   auto gen = make_generator(opt);
 
   struct Out {
@@ -148,6 +149,15 @@ int main() {
   // the same positions and tokens with another image: no reuse of either path
   const Out swap = run(image_follow, 8, {changed});
   report(swap.stats.reuse == Reuse::None, "another image at the same positions is not reused");
+  const auto pad = random_ids(2050);
+  const auto long_image = cat({&with_image, &pad});
+  run(long_image, 2, {image});
+  run(other, 2);
+  const Out parked = run(long_image, 2, {image});
+  run(other, 2);
+  const Out replaced = run(long_image, 2, {changed});
+  report(parked.stats.reuse == Reuse::Parked && replaced.stats.reuse == Reuse::None,
+         "parked image prompts match their image hashes");
   // a span outside the prompt is rejected
   bool threw = false;
   try {

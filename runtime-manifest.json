@@ -84,7 +84,8 @@
     "kv_fp8": true,
     "spec": true,
     "spec_threshold": 0.8,
-    "prefill_chunk": 2048,
+    "prefill_chunk": 4096,
+    "park_host_mib": 9216,
     "model_id": "inkling-2-mini-abliterated"
   },
   "runtime": {

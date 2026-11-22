@@ -297,6 +297,38 @@ void Runtime::restore_checkpoint(const void* src) {
   }
 }
 
+std::size_t Runtime::full_rows_bytes(int n) const {
+  if (n < 0 || n > options_.max_ctx)
+    throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
+                                std::to_string(options_.max_ctx) + "]");
+  const std::size_t row = state_.k_full.bytes() / NUM_FULL_VISITS / std::size_t(options_.max_ctx);
+  return 2 * std::size_t(NUM_FULL_VISITS) * row * std::size_t(n);
+}
+
+// one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
+// the parked copy (k visits, then v visits)
+void Runtime::save_full_rows(void* dst, int n) {
+  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
+  if (n == 0) return;
+  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  char* p = static_cast<char*>(dst);
+  for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
+    CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, pitch, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
+    p += bytes;
+  }
+}
+
+void Runtime::restore_full_rows(const void* src, int n) {
+  const std::size_t bytes = full_rows_bytes(n) / 2, width = bytes / NUM_FULL_VISITS;
+  if (n == 0) return;
+  const std::size_t pitch = state_.k_full.bytes() / NUM_FULL_VISITS;
+  const char* p = static_cast<const char*>(src);
+  for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
+    CUDA_CHECK(cudaMemcpy2DAsync(t->data, pitch, p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
+    p += bytes;
+  }
+}
+
 void Runtime::save_verify(int P, int m) {
   if (verify_widths_.empty()) throw std::logic_error("save_verify needs the speculative widths (options.spec)");
   verify_save(state_ptrs(), backup_, nullptr, P, m, stream_);

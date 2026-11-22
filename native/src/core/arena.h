@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <stdexcept>
 
 namespace ingine {
 
@@ -91,6 +92,11 @@ private:
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
     bool owns_        = true;
+};
+
+class PinnedHostOutOfMemory : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 class PinnedHostBuffer {

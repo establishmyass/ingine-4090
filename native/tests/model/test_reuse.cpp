@@ -114,6 +114,52 @@ int main() {
                 c.stats.reused_tokens, A.size());
     ok &= good;
   }
+  // An interleaved request overwrites the full KV prefix. Parking must reproduce the same continuation
+  // as a live prefix, including after both conversations have taken another turn.
+  const auto a = random_ids(2300), b = random_ids(2600);
+  auto follow_a = a, follow_b = b;
+  follow_a.insert(follow_a.end(), other.begin(), other.begin() + 23);
+  follow_b.insert(follow_b.end(), other.begin(), other.begin() + 31);
+  for (bool spec : {true, false}) {
+    opt.spec = spec;
+    opt.park_host_mib = 0;
+    gen.reset();
+    gen = make_generator(opt);
+    run(a, 0, greedy);
+    const Out ref_a = run(follow_a, 32, sampled);
+    run(b, 0, greedy);
+    const Out ref_b = run(follow_b, 32, sampled);
+    const Out cold = run(a, 2, greedy);
+    opt.park_host_mib = 640;
+    gen.reset();
+    gen = make_generator(opt);
+    run(a, 3, greedy);
+    run(b, 4, greedy);
+    const Out pa = run(follow_a, 32, sampled);
+    const Out pb = run(follow_b, 32, sampled);
+    const Out exact = run(follow_a, 32, sampled);
+    const Out repeat = run(follow_a, 32, sampled);
+    const bool good = cold.stats.reuse == Reuse::None && pa.stats.reuse == Reuse::Parked &&
+                      pb.stats.reuse == Reuse::Parked && pa.stats.reused_tokens == int(a.size()) &&
+                      pb.stats.reused_tokens == int(b.size()) && exact.stats.reuse == Reuse::Parked &&
+                      repeat.stats.reuse == Reuse::Checkpoint && pa.tokens == ref_a.tokens &&
+                      pb.tokens == ref_b.tokens && exact.tokens == ref_a.tokens && repeat.tokens == ref_a.tokens;
+    std::printf("%s alternating host-parked prompts, spec=%d\n", good ? "PASS" : "FAIL", int(spec));
+    ok &= good;
+  }
+  // Only one of these full-KV snapshots fits this budget. The oldest displaced prompt must be cold.
+  opt.park_host_mib = 300;
+  gen.reset();
+  gen = make_generator(opt);
+  const auto third = random_ids(2450);
+  run(a, 2, greedy);
+  run(b, 2, greedy);
+  run(third, 2, greedy);
+  const Out evicted = run(a, 2, greedy);
+  const Out recent = run(third, 2, greedy);
+  const bool bounded = evicted.stats.reuse == Reuse::None && recent.stats.reuse == Reuse::Parked;
+  std::printf("%s host budget evicts the oldest displaced prompt\n", bounded ? "PASS" : "FAIL");
+  ok &= bounded;
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
   double spec_threshold = 0.8, fake_delay = 0.02;
   double offload_experts = 0.0;
   int offload_threads = 8;
-  int prefill_chunk = 2048;
+  int prefill_chunk = 2048, park_host_mib = 0;
   bool offload_static = false;
   bool no_vision = false;
   int vision_threads = 0, image_max_tokens = 1024;
@@ -103,9 +103,9 @@ int main(int argc, char** argv) {
   ap.option("--offload-threads", "N", "CPU threads computing offloaded experts during decode (0: GPU reads them over PCIe)", &offload_threads);
   ap.flag("--offload-static", "keep the starting expert placement (no adaptive swaps)", &offload_static);
   ap.option("--prefill-chunk", "N",
-            "prompt tokens per prefill chunk, up to 7168 (default 2048; 4096 is ~8% faster on long prompts and needs "
-            "~0.7 GB more GPU memory)",
+            "prompt tokens per prefill chunk, up to 7168 (bare binary default 2048)",
             &prefill_chunk);
+  ap.option("--park-host-mib", "MiB", "host RAM budget for displaced conversation checkpoints (0 disables)", &park_host_mib);
   ap.flag("--no-vision", "do not load the vision tower (requests with images get 400)", &no_vision);
   ap.option("--vision-threads", "N", "CPU threads encoding images (0: one per physical core)", &vision_threads);
   ap.option("--image-max-tokens", "N",
@@ -127,6 +127,10 @@ int main(int argc, char** argv) {
   ap.option("--top-k", "", "top_k of requests that omit it, 0 = off (default: generation_config.json, else 0)",
             &top_k);
   ap.parse(argc, argv);
+  if (park_host_mib < 0) {
+    std::cerr << "ingine-serve: --park-host-mib must be nonnegative\n";
+    return 2;
+  }
   if (temperature > 2 || top_p == 0 || top_p > 1) {
     std::cerr << "ingine-serve: error: --temperature must be in [0, 2] and --top-p in (0, 1]\n";
     return 2;
@@ -160,6 +164,7 @@ int main(int argc, char** argv) {
       options.offload_threads = offload_threads;
       options.offload_adaptive = !offload_static;
       options.prefill_chunk = prefill_chunk;
+      options.park_host_mib = park_host_mib;
       spdlog::info("boot: process to make_generator {:.3f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start).count());
       ingine::BootPhase p("make_generator (total)");
       generator = ingine::model::make_generator(options);

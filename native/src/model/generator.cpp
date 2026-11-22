@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -82,6 +83,7 @@ class EngineGenerator final : public Generator {
         logits_(std::size_t(UNPADDED_VOCAB) * sizeof(float)),
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
+    if (options.park_host_mib < 0) throw std::invalid_argument("park_host_mib must be nonnegative");
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
     BootPhase spec_phase("generator: drafter + spec");
     if (options.spec) {
@@ -212,6 +214,8 @@ class EngineGenerator final : public Generator {
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     move_pending_ = false;
     for (OlderCheckpoint& o : older_) o.ids.clear();
+    parked_.clear();
+    spare_park_buffer_.reset();
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
   }
 
@@ -284,34 +288,53 @@ class EngineGenerator final : public Generator {
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
     std::size_t start = 0;
-    if (drafter_in_step && !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin()) &&
-        same_images(state_images_, images, prev.size())) {
+    auto fits = [&](const auto& tokens, const auto& held_images) {
+      return !tokens.empty() && tokens.size() <= n && std::equal(tokens.begin(), tokens.end(), ids.begin()) &&
+             same_images(held_images, images, tokens.size());
+    };
+    if (drafter_in_step && prev.size() < n && fits(prev, state_images_)) {
       start = prev.size();
       stats.reuse = Reuse::Extend;
-    } else {
-      // the longest checkpoint that is a prefix of `ids` with the same images: the VRAM one (-1) or an older one
-      auto fits = [&](const std::vector<std::int32_t>& c, const std::vector<ImageKey>& im) {
-        return !c.empty() && c.size() <= n && std::equal(c.begin(), c.end(), ids.begin()) && same_images(im, images, c.size());
-      };
-      int best = -2;
-      std::size_t best_len = 0;
-      if (fits(checkpoint_ids_, checkpoint_images_)) best = -1, best_len = checkpoint_ids_.size();
-      for (std::size_t i = 0; i < older_.size(); ++i)
-        if (older_[i].ids.size() > best_len && fits(older_[i].ids, older_[i].images)) best = int(i), best_len = older_[i].ids.size();
-      if (best == -1) {
-        restore_checkpoint();
-        stats.reuse = Reuse::Checkpoint;
-      } else if (best >= 0) {
-        restore_older(older_[std::size_t(best)]);
+    }
+    if (checkpoint_ids_.size() > start && fits(checkpoint_ids_, checkpoint_images_)) {
+      start = checkpoint_ids_.size();
+      stats.reuse = Reuse::Checkpoint;
+    }
+    const OlderCheckpoint* older = nullptr;
+    for (const auto& o : older_)
+      if (o.ids.size() > start && fits(o.ids, o.images)) {
+        start = o.ids.size();
+        older = &o;
         stats.reuse = Reuse::OlderCheckpoint;
-      } else {
-        reset_state(st, stream);
-        if (drafter_) drafter_->reset();
-        tokens_in_state_.clear();
-        state_images_.clear();
-        stats.reuse = Reuse::None;
       }
-      start = best >= -1 ? best_len : 0;
+    auto parked = parked_.end();
+    for (auto it = parked_.begin(); it != parked_.end(); ++it)
+      if (it->ids.size() > start && fits(it->ids, it->images)) {
+        start = it->ids.size();
+        parked = it;
+        stats.reuse = Reuse::Parked;
+      }
+    if (parked != parked_.end()) {
+      OlderCheckpoint incoming = std::move(*parked);
+      parked_.erase(parked);
+      park_live(incoming.buf->size());
+      rt_.restore_full_rows(static_cast<const char*>(incoming.buf->data()) + checkpoint_.bytes, int(start));
+      restore_older(incoming);
+      // The source stays pinned through the stream-ordered restore and can hold the next displaced chat.
+      spare_park_buffer_ = std::move(incoming.buf);
+      checkpoint_ids_.clear();
+      checkpoint_images_.clear();
+      for (auto& o : older_) o.ids.clear();  // these depended on the displaced conversation's full KV
+    } else if (older) {
+      restore_older(*older);
+    } else if (stats.reuse == Reuse::Checkpoint) {
+      restore_checkpoint();
+    } else if (stats.reuse == Reuse::None) {
+      park_live(0);
+      reset_state(st, stream);
+      if (drafter_) drafter_->reset();
+      tokens_in_state_.clear();
+      state_images_.clear();
     }
     // positions from `start` on are rewritten: checkpoints longer than that no longer match the state
     if (checkpoint_ids_.size() > start) checkpoint_ids_.clear(), checkpoint_images_.clear();
@@ -338,7 +361,7 @@ class EngineGenerator final : public Generator {
     tokens_in_state_.assign(ids.begin(), ids.end());
     state_images_.clear();
     for (const PromptImage& im : images) state_images_.push_back({im.pos, im.tokens, im.hash});
-    if (start < n) save_checkpoint();
+    if (start < n || stats.reuse == Reuse::Parked) save_checkpoint();
     stats.reused_tokens = int(start);
   }
 
@@ -397,24 +420,59 @@ class EngineGenerator final : public Generator {
     }
     OlderCheckpoint& o = older_[slot];
     if (!o.buf) o.buf = std::make_unique<PinnedHostBuffer>(checkpoint_.bytes);
+    CUDA_CHECK(cudaEventRecord(ev_ready_, rt_.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, ev_ready_, 0));
+    copy_checkpoint_to_host(o, copy_stream_);
+    CUDA_CHECK(cudaEventRecord(ev_moved_, copy_stream_));
+    move_pending_ = true;
+    o.seq = ++seq_;
+  }
+
+  void copy_checkpoint_to_host(OlderCheckpoint& o, cudaStream_t stream) {
     char* dst = static_cast<char*>(o.buf->data());
     const char* src = static_cast<const char*>(checkpoint_.p);
-    CUDA_CHECK(cudaEventRecord(ev_ready_, rt_.stream()));  // after the last save and any restore reading this slot
-    CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, ev_ready_, 0));
     auto copy = [&](std::size_t off, std::size_t bytes) {
-      if (bytes) CUDA_CHECK(cudaMemcpyAsync(dst + off, src + off, bytes, cudaMemcpyDeviceToHost, copy_stream_));
+      if (bytes) CUDA_CHECK(cudaMemcpyAsync(dst + off, src + off, bytes, cudaMemcpyDeviceToHost, stream));
     };
     copy(0, rt_.checkpoint_bytes());
     if (drafter_)
       for (const auto& [off, bytes] : drafter_->checkpoint_spans(drafter_->checkpoint_length())) copy(checkpoint_drafter_ + off, bytes);
     copy(checkpoint_logits_, logits_.bytes);
-    CUDA_CHECK(cudaEventRecord(ev_moved_, copy_stream_));
-    move_pending_ = true;
     o.ids = checkpoint_ids_;
     o.images = checkpoint_images_;
     o.drafter_length = drafter_ ? drafter_->checkpoint_length() : 0;
     o.drafter_extra = drafter_ ? drafter_->checkpoint_extra() : std::vector<std::int32_t>{};
-    o.seq = ++seq_;
+  }
+
+  void park_live(std::size_t reserved) {
+    // Small prompts are cheaper to re-read than to allocate and transfer a host checkpoint.
+    if (!options_.park_host_mib || checkpoint_ids_.size() < 2048) return;
+    const std::size_t budget = std::size_t(options_.park_host_mib) << 20;
+    const int rows = int(checkpoint_ids_.size());
+    const std::size_t bytes = checkpoint_.bytes + rt_.full_rows_bytes(rows);
+    if (bytes + reserved > budget) return;
+    std::size_t used = reserved;
+    for (const auto& p : parked_) used += p.buf->size();
+    // A larger spare must not evict another chat just to avoid an allocation.
+    if (spare_park_buffer_ && (spare_park_buffer_->size() < bytes ||
+        (spare_park_buffer_->size() > bytes && spare_park_buffer_->size() > budget - used)))
+      spare_park_buffer_.reset();
+    const std::size_t allocation = spare_park_buffer_ ? spare_park_buffer_->size() : bytes;
+    while (used + allocation > budget) {
+      used -= parked_.front().buf->size();
+      parked_.pop_front();
+    }
+    OlderCheckpoint entry;
+    try {
+      entry.buf = std::move(spare_park_buffer_);
+      if (!entry.buf) entry.buf = std::make_unique<PinnedHostBuffer>(bytes);
+    } catch (const PinnedHostOutOfMemory& error) {
+      spdlog::warn("conversation parking skipped: {}", error.what());
+      return;
+    }
+    copy_checkpoint_to_host(entry, rt_.stream());
+    rt_.save_full_rows(static_cast<char*>(entry.buf->data()) + checkpoint_.bytes, rows);
+    parked_.push_back(std::move(entry));  // the target stream orders copies before the next prefill
   }
 
   // Whether `held` (the images of a state holding `prefix` tokens) are exactly the images among the first
@@ -487,6 +545,8 @@ class EngineGenerator final : public Generator {
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
   std::vector<ImageKey> state_images_, checkpoint_images_;  // images in the state / the checkpoint
+  std::unique_ptr<PinnedHostBuffer> spare_park_buffer_;  // charged to the same budget
+  std::list<OlderCheckpoint> parked_;  // FIFO among displaced prompts; restored entries leave the cache
   std::vector<OlderCheckpoint> older_;  // earlier prompts' checkpoints in pinned host memory
   std::uint64_t seq_ = 0;
   cudaStream_t copy_stream_ = nullptr;

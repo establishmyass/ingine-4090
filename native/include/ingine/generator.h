@@ -31,9 +31,11 @@ enum class Reuse {
   Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
   Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
   OlderCheckpoint,  // restored a checkpoint of an earlier prompt (kept in host memory), the longest that matches
+  Parked,      // restored a displaced prompt and its full-attention KV from system RAM
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
+    case Reuse::Parked: return "parked";
     case Reuse::Extend: return "extend";
     case Reuse::Checkpoint: return "checkpoint";
     case Reuse::OlderCheckpoint: return "older-checkpoint";
@@ -77,6 +79,7 @@ struct RuntimeOptions {
   double offload_gib = 0.0;
   int offload_threads = 8;
   bool offload_adaptive = true;
+  int park_host_mib = 0;  // budget for displaced conversations in pinned host memory
 };
 
 class Generator {
